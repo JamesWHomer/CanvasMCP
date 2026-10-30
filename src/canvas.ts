@@ -69,21 +69,34 @@ export class CanvasClient {
     return data as T;
   }
 
-  /**
-   * Downloads a Canvas file URL. Canvas redirects downloads to separate file storage; redirects are followed
-   * by hand so the token is only ever sent to the Canvas host, never to the storage host.
-   */
+  /** Downloads a Canvas file URL into memory. */
   async download(url: string, maxBytes: number): Promise<{ bytes: Uint8Array; contentType?: string }> {
+    const res = await this.openDownload(url, TRANSFER_TIMEOUT_MS);
+    const declared = Number(res.headers.get("content-length"));
+    if (declared > maxBytes) throw new CanvasError(tooLarge(declared, maxBytes));
+    const bytes = new Uint8Array(await res.arrayBuffer());
+    if (bytes.length > maxBytes) throw new CanvasError(tooLarge(bytes.length, maxBytes));
+    return { bytes, contentType: res.headers.get("content-type") ?? undefined };
+  }
+
+  /**
+   * Opens a Canvas file URL and returns the final response, for the caller to read or stream. Canvas redirects
+   * downloads to separate file storage; redirects are followed by hand so the token is only ever sent to the
+   * Canvas host, never to the storage host.
+   */
+  async openDownload(url: string, timeoutMs: number): Promise<Response> {
     let current = new URL(url, this.origin);
     if (current.origin !== this.origin) {
       throw new CanvasError(`Refusing to download from ${current.origin}; expected a ${this.origin} file URL`);
     }
+    // One signal for the whole transfer, so it also bounds reading the body.
+    const signal = AbortSignal.timeout(timeoutMs);
     for (let hop = 0; hop <= MAX_REDIRECTS; hop++) {
       this.assertTransferUrl(current);
       const res = await this.send(current, {
         redirect: "manual",
         headers: current.origin === this.origin ? { Authorization: `Bearer ${this.token}` } : {},
-        signal: AbortSignal.timeout(TRANSFER_TIMEOUT_MS),
+        signal,
       });
       if (res.status >= 300 && res.status < 400) {
         const location = res.headers.get("location");
@@ -92,11 +105,7 @@ export class CanvasClient {
         continue;
       }
       if (!res.ok) throw new CanvasError(`File download failed with status ${res.status}`, res.status);
-      const declared = Number(res.headers.get("content-length"));
-      if (declared > maxBytes) throw new CanvasError(tooLarge(declared, maxBytes));
-      const bytes = new Uint8Array(await res.arrayBuffer());
-      if (bytes.length > maxBytes) throw new CanvasError(tooLarge(bytes.length, maxBytes));
-      return { bytes, contentType: res.headers.get("content-type") ?? undefined };
+      return res;
     }
     throw new CanvasError("File download redirected too many times");
   }
@@ -220,7 +229,7 @@ export function normalizeBaseUrl(raw: string): string {
   return new URL(withScheme).origin;
 }
 
-function tooLarge(size: number, max: number): string {
+export function tooLarge(size: number, max: number): string {
   return `File is ${(size / 1e6).toFixed(1)} MB, over the ${(max / 1e6).toFixed(0)} MB limit`;
 }
 

@@ -27,6 +27,9 @@ export function createCanvasServer(
         "Access to the user's Canvas LMS account. Start with list_courses to get course IDs. " +
         "For \"what's due\" or \"what am I missing\" questions use get_planner; for \"what's new\" use get_recent_activity. " +
         "Use read_file to read PDFs, slides and other course files. " +
+        (allowLocalFiles
+          ? "Use download_files to save original files (e.g. a template to fill in) to the user's computer. "
+          : "") +
         "Timestamps are UTC; get_profile returns the user's time zone for converting them." +
         (allowWrites
           ? " Write tools are enabled. submit_assignment, post_discussion_reply and send_message act on the user's behalf " +

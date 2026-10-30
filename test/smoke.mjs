@@ -1,6 +1,6 @@
 // End-to-end check: runs the built server (stdio and HTTP) against a mock Canvas API and a mock file-storage host.
 import assert from "node:assert/strict";
-import { mkdtemp, rm, writeFile } from "node:fs/promises";
+import { mkdtemp, readFile, readdir, rm, writeFile } from "node:fs/promises";
 import { createServer } from "node:http";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -14,7 +14,9 @@ import { handleMcpRequest } from "../dist/http.js";
 
 const TOKEN = "test-token";
 const READ_TOOLS = 26;
+const LOCAL_TOOLS = 1; // download_files, stdio server only
 const WRITE_TOOLS = 5;
+const downloadDir = await mkdtemp(join(tmpdir(), "canvas-mcp-downloads-"));
 
 // ---------- fixtures ----------
 
@@ -222,6 +224,7 @@ const canvas = createServer(async (req, res) => {
     "GET /api/v1/files/58": file("58", "notes.txt", "text/plain"),
     "GET /api/v1/files/59": file("59", "diagram.png", "image/png"),
     "GET /api/v1/files/60": () => send(200, { id: "60", display_name: "locked.pdf", url: "", lock_explanation: "Unlocks Monday" }),
+    "GET /api/v1/files/61": file("61", "../../evil:name.txt", "text/plain"),
     "GET /api/v1/calendar_events": () => {
       const codes = url.searchParams.getAll("context_codes[]");
       send(200, codes.slice(0, 1).map((code) => ({ id: code, title: `Event for ${code}`, start_at: "2026-11-03T01:00:00Z" })));
@@ -283,7 +286,7 @@ const canvas = createServer(async (req, res) => {
   };
   if (req.method === "GET" && url.pathname.match(/^\/files\/\d+\/download$/)) {
     const id = url.pathname.split("/")[2];
-    const names = { 55: "slides.pdf", 56: "spec.docx", 57: "lecture.pptx", 58: "notes.txt", 59: "diagram.png" };
+    const names = { 55: "slides.pdf", 56: "spec.docx", 57: "lecture.pptx", 58: "notes.txt", 59: "diagram.png", 61: "notes.txt" };
     res.writeHead(302, { location: `${storageOrigin}/blob/${names[id]}` });
     return res.end();
   }
@@ -313,7 +316,7 @@ async function connect(env) {
     new StdioClientTransport({
       command: process.execPath,
       args: [fileURLToPath(new URL("../dist/index.js", import.meta.url))],
-      env: { ...getDefaultEnvironment(), ...env },
+      env: { ...getDefaultEnvironment(), CANVAS_DOWNLOAD_DIR: downloadDir, ...env },
       stderr: "ignore",
     }),
   );
@@ -343,14 +346,15 @@ const lastRequest = (method, path) => canvasLog.filter((r) => r.method === metho
 
 const client = await connect({ CANVAS_BASE_URL: baseUrl, CANVAS_API_TOKEN: TOKEN, CANVAS_ALLOW_WRITES: "" });
 
-await check("lists read tools only by default, with string ID schemas", async () => {
+await check("lists read tools (plus local download) by default, with string ID schemas", async () => {
   const { tools } = await client.listTools();
-  assert.equal(tools.length, READ_TOOLS);
+  assert.equal(tools.length, READ_TOOLS + LOCAL_TOOLS);
   assert.ok(!tools.some((t) => t.name === "submit_assignment"));
   const getAssignment = tools.find((t) => t.name === "get_assignment");
   assert.equal(getAssignment.inputSchema.properties.course_id.type, "string");
   assert.deepEqual(getAssignment.inputSchema.required.sort(), ["assignment_id", "course_id"]);
-  assert.ok(tools.every((t) => t.annotations?.readOnlyHint));
+  // download_files writes to the user's disk (not to Canvas), so it isn't read-only.
+  assert.deepEqual(tools.filter((t) => !t.annotations?.readOnlyHint).map((t) => t.name), ["download_files"]);
 });
 
 await check("get_profile", async () => {
@@ -455,6 +459,39 @@ await check("read_file: locked files explain why", async () => {
   const result = await call(client, "read_file", { file_id: "60" });
   assert.equal(result.isError, true);
   assert.match(result.data, /Unlocks Monday/);
+});
+
+await check("download_files: saves the original bytes, token never sent to the storage host", async () => {
+  storageLog.length = 0;
+  const { data } = await call(client, "download_files", { file_ids: ["55", "56"] });
+  assert.equal(data.directory, downloadDir);
+  assert.equal(data.saved, 2);
+  assert.deepEqual(data.files.map((f) => f.path), [join(downloadDir, "slides.pdf"), join(downloadDir, "spec.docx")]);
+  assert.deepEqual(await readFile(join(downloadDir, "slides.pdf")), storageFiles["/blob/slides.pdf"]);
+  assert.deepEqual(await readFile(join(downloadDir, "spec.docx")), storageFiles["/blob/spec.docx"]);
+  assert.equal(data.files[0].size, storageFiles["/blob/slides.pdf"].length);
+  assert.ok(storageLog.every((r) => r.auth === undefined));
+});
+
+await check("download_files: never overwrites, and numbers duplicates within a batch", async () => {
+  const { data } = await call(client, "download_files", { file_ids: ["55", 55] });
+  assert.deepEqual(data.files.map((f) => f.name && f.path.slice(downloadDir.length + 1)), ["slides (1).pdf", "slides (2).pdf"]);
+  assert.deepEqual(await readFile(join(downloadDir, "slides.pdf")), storageFiles["/blob/slides.pdf"]);
+});
+
+await check("download_files: unsafe names stay inside the folder; relative folders nest under the default", async () => {
+  const { data } = await call(client, "download_files", { file_ids: ["61"], directory: "week3" });
+  assert.equal(data.files[0].path, join(downloadDir, "week3", ".._.._evil_name.txt"));
+  assert.deepEqual(await readdir(join(downloadDir, "week3")), [".._.._evil_name.txt"]);
+});
+
+await check("download_files: one failure doesn't stop the rest, and leaves no partial files", async () => {
+  const { data } = await call(client, "download_files", { file_ids: ["60", "404", "58"] });
+  assert.equal(data.saved, 1);
+  assert.match(data.files[0].error, /Unlocks Monday/);
+  assert.match(data.files[1].error, /404/);
+  assert.equal(data.files[2].path, join(downloadDir, "notes.txt"));
+  assert.ok(!(await readdir(downloadDir)).some((f) => f.endsWith(".part")));
 });
 
 await check("list_calendar_events batches context codes in tens", async () => {
@@ -567,7 +604,7 @@ const SUBMIT = "/api/v1/courses/101/assignments/10/submissions";
 
 await check("writes: tools appear only when enabled, marked as not read-only", async () => {
   const { tools } = await writer.listTools();
-  assert.equal(tools.length, READ_TOOLS + WRITE_TOOLS);
+  assert.equal(tools.length, READ_TOOLS + LOCAL_TOOLS + WRITE_TOOLS);
   assert.equal(tools.find((t) => t.name === "submit_assignment").annotations.destructiveHint, true);
 });
 
@@ -720,6 +757,7 @@ await check("HTTP: key in path works end to end", async () => {
   const client = await httpClient(`${httpBase}/mcp/${ACCESS_KEY}`);
   const { tools } = await client.listTools();
   assert.equal(tools.length, READ_TOOLS);
+  assert.ok(!tools.some((t) => t.name === "download_files"), "the remote server can't write to the user's disk");
   const { data } = await call(client, "list_courses");
   assert.deepEqual(data.map((c) => c.id), ["101", "102"]);
   await client.close();
@@ -772,5 +810,6 @@ await check("HTTP: fails closed when MCP_ACCESS_KEY is unset", async () => {
 httpServer.close();
 canvas.close();
 storage.close();
+await rm(downloadDir, { recursive: true });
 console.log(failures ? `\n${failures} check(s) failed` : "\nAll checks passed");
 process.exit(failures ? 1 : 0);

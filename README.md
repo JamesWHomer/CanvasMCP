@@ -121,6 +121,7 @@ vercel deploy --prod
 | `get_syllabus` | The Syllabus page as Markdown |
 | `list_files` / `get_file` | Course files and download links |
 | `read_file` | A file's contents: text from PDFs (by page), .docx, .pptx (with speaker notes), .xlsx, notebooks, HTML and code. Images come back as images. Long files are paged |
+| `download_files` | **Local server only.** Saves original files to your computer, e.g. a .docx template to fill in with its formatting intact. Saves to `~/Downloads/Canvas` (or `CANVAS_DOWNLOAD_DIR`) and never overwrites anything. Pair it with `submit_assignment`'s `path` to send the finished file back |
 | `list_discussions` / `get_discussion` | Discussion topics and their full reply threads |
 | `list_calendar_events` | Calendar events across courses and your personal calendar |
 | `list_conversations` / `get_conversation` | Canvas Inbox, with attachments (reading doesn't mark messages read) |
