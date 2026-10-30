@@ -1,53 +1,20 @@
+// The original read-only tools: profile, courses, planner, assignments, content, files, grades, discussions.
 import { z } from "zod";
-import type { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
-import type { CallToolResult } from "@modelcontextprotocol/sdk/types.js";
-import type { CanvasClient, Params } from "./canvas.js";
-import { compact, htmlToMarkdown, truncate } from "./format.js";
+import type { Params } from "../canvas.js";
+import { compact, htmlToMarkdown, truncate } from "../format.js";
+import {
+  DAY_MS,
+  READ_ONLY,
+  activeCourseIds,
+  courseId,
+  resolveRange,
+  run,
+  submissionSummary,
+  type Obj,
+  type ToolContext,
+} from "./shared.js";
 
-// Canvas responses are large, loosely-typed objects; the mappers below pick out the useful fields.
-type Obj = Record<string, any>;
-
-const READ_ONLY = { readOnlyHint: true, openWorldHint: true } as const;
-const DAY_MS = 86_400_000;
-
-// IDs are coerced so the tools accept both "123" and 123.
-const courseId = z.coerce.string().describe("Canvas course ID (from list_courses)");
-
-async function run(fn: () => Promise<unknown>): Promise<CallToolResult> {
-  try {
-    const data = await fn();
-    return { content: [{ type: "text", text: JSON.stringify(data, null, 2) }] };
-  } catch (err) {
-    return { isError: true, content: [{ type: "text", text: err instanceof Error ? err.message : String(err) }] };
-  }
-}
-
-function submissionSummary(s: Obj | undefined) {
-  if (!s) return undefined;
-  return compact({
-    state: s.workflow_state,
-    submitted_at: s.submitted_at,
-    score: s.score,
-    grade: s.grade,
-    attempt: s.attempt,
-    late: s.late || undefined,
-    missing: s.missing || undefined,
-    excused: s.excused || undefined,
-  });
-}
-
-function startOfToday(): Date {
-  const d = new Date();
-  d.setHours(0, 0, 0, 0);
-  return d;
-}
-
-export function registerTools(server: McpServer, canvas: () => CanvasClient): void {
-  const activeCourseIds = async (c: CanvasClient): Promise<string[]> => {
-    const courses = await c.getAll<Obj>("courses", { enrollment_state: "active" });
-    return courses.filter((x) => !x.access_restricted_by_date).map((x) => String(x.id));
-  };
-
+export function registerCoreTools({ server, canvas }: ToolContext): void {
   server.registerTool(
     "get_profile",
     {
@@ -117,10 +84,16 @@ export function registerTools(server: McpServer, canvas: () => CanvasClient): vo
     {
       title: "Planner: what's due",
       description:
-        "List to-do items across all courses (assignments, quizzes, discussions, announcements, calendar events) in a date range, with submission status. Best tool for questions like \"what's due this week?\" or \"what am I missing?\". Defaults to today through the next 14 days; set start_date in the past to find missing work. Times are UTC.",
+        "List to-do items across all courses (assignments, quizzes, discussions, announcements, calendar events, personal planner notes) in a date range, with submission status. Best tool for questions like \"what's due this week?\" or \"what am I missing?\". Defaults to today (in the user's time zone) through the next 14 days; set start_date in the past to find missing work. Times are UTC. Each item's type and id can be passed to set_planner_item_done when writes are enabled.",
       inputSchema: {
-        start_date: z.string().optional().describe("ISO date or datetime, e.g. 2026-10-30. Default: start of today."),
-        end_date: z.string().optional().describe("ISO date or datetime. Default: 14 days after start_date."),
+        start_date: z
+          .string()
+          .optional()
+          .describe("Date (whole day, user's time zone) or ISO datetime, e.g. 2026-10-30. Default: start of today."),
+        end_date: z
+          .string()
+          .optional()
+          .describe("Date (inclusive) or ISO datetime. Default: 14 days after start_date."),
         course_id: courseId.optional().describe("Limit to one course"),
         incomplete_only: z.boolean().optional().describe("Only items not yet submitted or marked done"),
       },
@@ -129,11 +102,7 @@ export function registerTools(server: McpServer, canvas: () => CanvasClient): vo
     async ({ start_date, end_date, course_id, incomplete_only }) =>
       run(async () => {
         const c = canvas();
-        const start = start_date ? new Date(start_date) : startOfToday();
-        if (Number.isNaN(start.getTime())) throw new Error(`Invalid start_date: ${start_date}`);
-        const end = end_date ? new Date(end_date) : new Date(start.getTime() + 14 * DAY_MS);
-        if (Number.isNaN(end.getTime())) throw new Error(`Invalid end_date: ${end_date}`);
-
+        const { start, end } = await resolveRange(c, start_date, end_date, 14);
         const items = await c.getAll<Obj>("planner/items", {
           start_date: start.toISOString(),
           end_date: end.toISOString(),
@@ -452,7 +421,7 @@ export function registerTools(server: McpServer, canvas: () => CanvasClient): vo
     "get_file",
     {
       title: "Get file info",
-      description: "Get a file's metadata and a download link the user can open.",
+      description: "Get a file's metadata and a download link the user can open. Use read_file to read its contents.",
       inputSchema: { file_id: z.coerce.string().describe("File ID (from list_files, or content_id of a File module item)") },
       annotations: READ_ONLY,
     },

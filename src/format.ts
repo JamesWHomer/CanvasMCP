@@ -11,6 +11,16 @@ export function htmlToMarkdown(html: string | null | undefined): string | undefi
   return md || undefined;
 }
 
+/** Plain text to Canvas rich-content HTML: blank lines separate paragraphs, single newlines become <br>. */
+export function textToHtml(text: string): string {
+  const escape = (s: string) => s.replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;");
+  return text
+    .trim()
+    .split(/\n\s*\n/)
+    .map((p) => `<p>${escape(p).replace(/\n/g, "<br>")}</p>`)
+    .join("\n");
+}
+
 export function truncate(text: string | undefined, max: number): string | undefined {
   if (!text || text.length <= max) return text;
   return `${text.slice(0, max)}… [truncated, ${text.length - max} more characters]`;

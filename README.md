@@ -1,6 +1,12 @@
 # Canvas MCP
 
-A read-only [MCP](https://modelcontextprotocol.io) server for the Canvas LMS REST API. It lets Claude check what's due, read assignments, rubrics, pages, the syllabus, announcements, discussions and grades in your Canvas account. It signs in with a personal access token.
+An [MCP](https://modelcontextprotocol.io) server for the Canvas LMS REST API. It lets Claude:
+
+- check what's due, and read assignments, rubrics, course files (PDFs, slides, docs), pages, announcements, discussions, the inbox and grades
+- work out what you need to hit a target grade
+- optionally submit assignments, post replies and send messages, each after you approve a preview
+
+It signs in with a personal access token.
 
 It runs two ways:
 
@@ -74,6 +80,7 @@ The Vercel project `canvas-mcp` serves the same tools over Streamable HTTP from 
 | `CANVAS_BASE_URL` | `https://canvas.sydney.edu.au` |
 | `CANVAS_API_TOKEN` | Canvas token (secret) |
 | `MCP_ACCESS_KEY` | Random key every request must present (secret; a copy is in the local `.env`) |
+| `CANVAS_ALLOW_WRITES` | `true` turns on the [write tools](#write-tools) |
 
 Every request must carry the access key, otherwise it gets a `401`. If `MCP_ACCESS_KEY` isn't set, the server rejects every request. The key can go in the URL path or in a header:
 
@@ -113,9 +120,31 @@ vercel deploy --prod
 | `list_pages` / `get_page` | Course wiki pages as Markdown (`front_page` for the course home) |
 | `get_syllabus` | The Syllabus page as Markdown |
 | `list_files` / `get_file` | Course files and download links |
+| `read_file` | A file's contents: text from PDFs (by page), .docx, .pptx (with speaker notes), .xlsx, notebooks, HTML and code. Images come back as images. Long files are paged |
 | `list_discussions` / `get_discussion` | Discussion topics and their full reply threads |
+| `list_calendar_events` | Calendar events across courses and your personal calendar |
+| `list_conversations` / `get_conversation` | Canvas Inbox, with attachments (reading doesn't mark messages read) |
+| `get_recent_activity` | What's new: announcements, messages, newly graded work |
+| `calculate_grade` | Current grade, the possible final range, what-if scores, and the average needed on remaining work for a target. Accepts the weight of assessments not in Canvas, such as an exam |
+| `list_quizzes` / `get_quiz` | Classic and New Quizzes with time limits, attempts and scores |
+| `list_course_people` | Teaching staff (or classmates by name) with user IDs and emails |
+| `list_my_groups` | Your groups in current courses, with members |
 | `canvas_api_get` | Raw read-only GET for any other [Canvas API](https://canvas.instructure.com/doc/api/) endpoint |
 
-All tools are read-only: nothing gets submitted, posted or changed. The token is only ever sent to `CANVAS_BASE_URL`, and the raw tool is limited to `/api/v1/` paths on that host.
+Dates given as a bare day (e.g. `2026-11-03`) mean that whole day in your Canvas time zone. Timestamps come back in UTC; the model converts them using the time zone from `get_profile`.
 
-Timestamps are returned in UTC as Canvas sends them. The model can convert them using the time zone from `get_profile`.
+The token is only ever sent to `CANVAS_BASE_URL`. File downloads and uploads go through Canvas's separate storage host without the token, and the raw tool is limited to `/api/v1/` paths.
+
+### Write tools
+
+These are off unless `CANVAS_ALLOW_WRITES=true`. They're on in the local `.env` and on Vercel.
+
+| Tool | What it does |
+| --- | --- |
+| `submit_assignment` | Submit text, a URL, or files. Files can be given as text, base64 or, on the local server only, a path on disk |
+| `post_discussion_reply` | Reply to a discussion topic or a specific entry |
+| `send_message` | Send a Canvas Inbox message to people (IDs from `list_course_people`), or reply in a conversation |
+| `set_planner_item_done` | Tick off (or un-tick) an item in your Canvas to-do list |
+| `create_planner_note` | Add a personal to-do to your Canvas planner |
+
+`submit_assignment`, `post_discussion_reply` and `send_message` are two-step. A call without `confirm: true` only returns a preview, which also flags late submissions, attempts left and disallowed file types. The action happens only on a second call with `confirm: true`, after you've approved the preview. Quizzes can't be taken through this server.

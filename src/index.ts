@@ -18,5 +18,5 @@ function loadDotEnv(): void {
 loadDotEnv();
 
 const client = clientFromEnv();
-await createCanvasServer(client).connect(new StdioServerTransport());
+await createCanvasServer(client, { allowLocalFiles: true }).connect(new StdioServerTransport());
 console.error(client ? `Canvas MCP server connected to ${client.origin}` : "Canvas MCP server started without credentials");

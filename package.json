@@ -1,7 +1,7 @@
 {
   "name": "canvas-mcp",
-  "version": "1.0.0",
-  "description": "MCP server for the Canvas LMS REST API (read-only), authenticated with a personal access token",
+  "version": "1.1.0",
+  "description": "MCP server for the Canvas LMS REST API, authenticated with a personal access token",
   "type": "module",
   "main": "dist/index.js",
   "bin": {
@@ -18,7 +18,9 @@
   "license": "ISC",
   "dependencies": {
     "@modelcontextprotocol/sdk": "^1.32.2",
+    "fflate": "^0.8.3",
     "turndown": "^7.2.4",
+    "unpdf": "^2.0.1",
     "zod": "^4.6.7"
   },
   "devDependencies": {

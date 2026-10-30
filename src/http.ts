@@ -27,7 +27,7 @@ export async function handleMcpRequest(req: Request): Promise<Response> {
   if (!expected) return json(500, "Server misconfigured: MCP_ACCESS_KEY is not set.");
   if (!keyMatches(presentedKey(req), expected)) return json(401, "Unauthorized: missing or wrong access key.");
 
-  const server = createCanvasServer(clientFromEnv());
+  const server = createCanvasServer(clientFromEnv(), { allowLocalFiles: false });
   const transport = new WebStandardStreamableHTTPServerTransport({
     sessionIdGenerator: undefined,
     enableJsonResponse: true,

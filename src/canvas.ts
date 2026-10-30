@@ -1,4 +1,4 @@
-// Minimal Canvas REST API client: token auth, query encoding, Link-header pagination.
+// Minimal Canvas REST API client: token auth, query encoding, Link-header pagination, file download and upload.
 
 export type ParamValue = string | number | boolean | undefined | (string | number)[];
 export type Params = Record<string, ParamValue>;
@@ -6,6 +6,8 @@ export type Params = Record<string, ParamValue>;
 // Upper bound on items collected by getAll so one call can't page through an entire institution.
 const DEFAULT_MAX_ITEMS = 500;
 const REQUEST_TIMEOUT_MS = 30_000;
+const TRANSFER_TIMEOUT_MS = 120_000;
+const MAX_REDIRECTS = 5;
 
 export class CanvasError extends Error {
   constructor(
@@ -15,6 +17,12 @@ export class CanvasError extends Error {
     super(message);
     this.name = "CanvasError";
   }
+}
+
+export interface UploadFile {
+  name: string;
+  bytes: Uint8Array<ArrayBuffer>;
+  contentType: string;
 }
 
 export class CanvasClient {
@@ -51,6 +59,88 @@ export class CanvasClient {
     return items.slice(0, maxItems);
   }
 
+  async post<T = unknown>(path: string, body: unknown): Promise<T> {
+    const { data } = await this.fetchJson(this.apiUrl(path), { method: "POST", body });
+    return data as T;
+  }
+
+  async put<T = unknown>(path: string, body: unknown): Promise<T> {
+    const { data } = await this.fetchJson(this.apiUrl(path), { method: "PUT", body });
+    return data as T;
+  }
+
+  /**
+   * Downloads a Canvas file URL. Canvas redirects downloads to separate file storage; redirects are followed
+   * by hand so the token is only ever sent to the Canvas host, never to the storage host.
+   */
+  async download(url: string, maxBytes: number): Promise<{ bytes: Uint8Array; contentType?: string }> {
+    let current = new URL(url, this.origin);
+    if (current.origin !== this.origin) {
+      throw new CanvasError(`Refusing to download from ${current.origin}; expected a ${this.origin} file URL`);
+    }
+    for (let hop = 0; hop <= MAX_REDIRECTS; hop++) {
+      this.assertTransferUrl(current);
+      const res = await this.send(current, {
+        redirect: "manual",
+        headers: current.origin === this.origin ? { Authorization: `Bearer ${this.token}` } : {},
+        signal: AbortSignal.timeout(TRANSFER_TIMEOUT_MS),
+      });
+      if (res.status >= 300 && res.status < 400) {
+        const location = res.headers.get("location");
+        if (!location) throw new CanvasError(`Download redirect (${res.status}) had no Location header`);
+        current = new URL(location, current);
+        continue;
+      }
+      if (!res.ok) throw new CanvasError(`File download failed with status ${res.status}`, res.status);
+      const declared = Number(res.headers.get("content-length"));
+      if (declared > maxBytes) throw new CanvasError(tooLarge(declared, maxBytes));
+      const bytes = new Uint8Array(await res.arrayBuffer());
+      if (bytes.length > maxBytes) throw new CanvasError(tooLarge(bytes.length, maxBytes));
+      return { bytes, contentType: res.headers.get("content-type") ?? undefined };
+    }
+    throw new CanvasError("File download redirected too many times");
+  }
+
+  /**
+   * Uploads a file into the user's submission attachments for an assignment (Canvas's 3-step upload flow)
+   * and returns the new file's ID for use in a submission.
+   */
+  async uploadSubmissionFile(courseId: string, assignmentId: string, file: UploadFile): Promise<string> {
+    // Step 1: tell Canvas about the file; it answers with where and how to upload it.
+    const ticket = await this.post<{ upload_url: string; upload_params: Record<string, string>; file_param?: string }>(
+      `courses/${courseId}/assignments/${assignmentId}/submissions/self/files`,
+      { name: file.name, size: file.bytes.length, content_type: file.contentType, on_duplicate: "rename" },
+    );
+
+    // Step 2: multipart POST to the storage host. Upload params go first; the token is not sent off-host.
+    const uploadUrl = new URL(ticket.upload_url);
+    this.assertTransferUrl(uploadUrl);
+    const form = new FormData();
+    for (const [key, value] of Object.entries(ticket.upload_params ?? {})) form.append(key, value);
+    form.append(ticket.file_param ?? "file", new Blob([file.bytes], { type: file.contentType }), file.name);
+    const res = await this.send(uploadUrl, {
+      method: "POST",
+      body: form,
+      redirect: "manual",
+      headers: uploadUrl.origin === this.origin ? { Authorization: `Bearer ${this.token}` } : {},
+      signal: AbortSignal.timeout(TRANSFER_TIMEOUT_MS),
+    });
+
+    // Step 3: the storage host either returns the file JSON or points back at Canvas to confirm it.
+    const text = await res.text();
+    if (res.status >= 400) throw new CanvasError(`File upload failed with status ${res.status}: ${text.slice(0, 300)}`);
+    try {
+      const body = JSON.parse(text);
+      if (body?.id) return String(body.id);
+    } catch {
+      // Not JSON; fall through to the Location header.
+    }
+    const location = res.headers.get("location");
+    if (!location) throw new CanvasError(`File upload returned status ${res.status} without a file ID`);
+    const confirmed = await this.get<{ id: string | number }>(new URL(location, uploadUrl).toString());
+    return String(confirmed.id);
+  }
+
   /**
    * Accepts "courses/1", "/api/v1/courses/1" or a full URL on the Canvas host (pagination links, items_url).
    * Anything that would leave the configured host or the /api/v1 tree is rejected so the token never leaks.
@@ -77,21 +167,37 @@ export class CanvasClient {
     return url;
   }
 
-  private async fetchJson(url: URL): Promise<{ data: unknown; next?: string }> {
-    let res: Response;
+  // File storage hosts must be HTTPS; plain HTTP is only tolerated when Canvas itself is (local testing).
+  private assertTransferUrl(url: URL): void {
+    if (url.protocol !== "https:" && !(url.protocol === "http:" && this.origin.startsWith("http:"))) {
+      throw new CanvasError(`Refusing non-HTTPS file transfer to ${url.origin}`);
+    }
+  }
+
+  private async send(url: URL, init: RequestInit): Promise<Response> {
     try {
-      res = await fetch(url, {
-        headers: {
-          Authorization: `Bearer ${this.token}`,
-          // Return IDs as strings; some Canvas instances use IDs larger than JS can represent exactly.
-          Accept: "application/json+canvas-string-ids",
-        },
-        signal: AbortSignal.timeout(REQUEST_TIMEOUT_MS),
-      });
+      return await fetch(url, init);
     } catch (err) {
       const reason = err instanceof Error ? err.message : String(err);
-      throw new CanvasError(`Could not reach Canvas at ${this.origin}: ${reason}`);
+      throw new CanvasError(`Could not reach ${url.origin}: ${reason}`);
     }
+  }
+
+  private async fetchJson(
+    url: URL,
+    init: { method?: "POST" | "PUT"; body?: unknown } = {},
+  ): Promise<{ data: unknown; next?: string }> {
+    const res = await this.send(url, {
+      method: init.method ?? "GET",
+      headers: {
+        Authorization: `Bearer ${this.token}`,
+        // Return IDs as strings; some Canvas instances use IDs larger than JS can represent exactly.
+        Accept: "application/json+canvas-string-ids",
+        ...(init.body !== undefined ? { "Content-Type": "application/json" } : {}),
+      },
+      body: init.body !== undefined ? JSON.stringify(init.body) : undefined,
+      signal: AbortSignal.timeout(REQUEST_TIMEOUT_MS),
+    });
 
     const text = (await res.text()).replace(/^while\(1\);/, "");
     if (!res.ok) throw new CanvasError(describeError(res.status, url, text), res.status);
@@ -112,6 +218,10 @@ export function normalizeBaseUrl(raw: string): string {
   const trimmed = raw.trim();
   const withScheme = /^https?:\/\//i.test(trimmed) ? trimmed : `https://${trimmed}`;
   return new URL(withScheme).origin;
+}
+
+function tooLarge(size: number, max: number): string {
+  return `File is ${(size / 1e6).toFixed(1)} MB, over the ${(max / 1e6).toFixed(0)} MB limit`;
 }
 
 function nextLink(header: string | null): string | undefined {
