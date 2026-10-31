@@ -3,6 +3,7 @@
 An [MCP](https://modelcontextprotocol.io) server for the Canvas LMS REST API. It lets Claude:
 
 - check what's due, and read assignments, rubrics, course files (PDFs, slides, docs), pages, announcements, discussions, the inbox and grades
+- read and download transcripts (subtitles) of recorded lectures in Echo360
 - work out what you need to hit a target grade
 - optionally submit assignments, post replies and send messages, each after you approve a preview
 
@@ -122,6 +123,9 @@ vercel deploy --prod
 | `list_files` / `get_file` | Course files and download links |
 | `read_file` | A file's contents: text from PDFs (by page), .docx, .pptx (with speaker notes), .xlsx, notebooks, HTML and code. Images come back as images. Long files are paged |
 | `download_files` | **Local server only.** Saves original files to your computer, e.g. a .docx template to fill in with its formatting intact. Saves to `~/Downloads/Canvas` (or `CANVAS_DOWNLOAD_DIR`) and never overwrites anything. Pair it with `submit_assignment`'s `path` to send the finished file back |
+| `list_lecture_recordings` | A course's recorded lectures and videos from its Echo360 tool ("Recorded Lectures"), including ones in folders |
+| `get_lecture_transcript` | What was said in a recording: plain text with a timestamp about once a minute, or `vtt` / `srt` subtitles. Long transcripts are paged |
+| `download_lecture_transcripts` | **Local server only.** Saves transcripts for some or all of a course's recordings as `.srt` (default), `.vtt` or `.txt` files, in a "<course> transcripts" folder under `~/Downloads/Canvas` |
 | `list_discussions` / `get_discussion` | Discussion topics and their full reply threads |
 | `list_calendar_events` | Calendar events across courses and your personal calendar |
 | `list_conversations` / `get_conversation` | Canvas Inbox, with attachments (reading doesn't mark messages read) |
@@ -135,6 +139,12 @@ vercel deploy --prod
 Dates given as a bare day (e.g. `2026-11-03`) mean that whole day in your Canvas time zone. Timestamps come back in UTC; the model converts them using the time zone from `get_profile`.
 
 The token is only ever sent to `CANVAS_BASE_URL`. File downloads and uploads go through Canvas's separate storage host without the token, and the raw tool is limited to `/api/v1/` paths.
+
+### Lecture transcripts
+
+Recorded lectures live in Echo360, not Canvas. The lecture tools ask Canvas for a one-time launch link to the course's Echo360 tool and follow it the way your browser does when you click **Recorded Lectures**. That gives an Echo360 session (reused for 10 minutes), without sending your Canvas token to Echo360. They then call the endpoints Echo360's own video player uses. Those endpoints aren't a documented API, so an Echo360 update could break these tools.
+
+The transcripts are Echo360's automatic speech recognition. They're usually good, but names and technical terms can be misheard. Speaker labels are left out because Echo360's are unreliable. A recording that hasn't been transcribed is reported and skipped.
 
 ### Write tools
 

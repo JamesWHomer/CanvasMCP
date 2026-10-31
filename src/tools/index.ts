@@ -4,6 +4,7 @@ import { registerAssessmentTools } from "./assessment.js";
 import { registerCommunityTools } from "./community.js";
 import { registerCoreTools } from "./core.js";
 import { registerFileTools } from "./files.js";
+import { registerLectureTools } from "./lectures.js";
 import { registerWriteTools } from "./write.js";
 
 export interface ToolOptions {
@@ -19,5 +20,6 @@ export function registerTools(server: McpServer, canvas: () => CanvasClient, opt
   registerFileTools(ctx);
   registerCommunityTools(ctx);
   registerAssessmentTools(ctx);
+  registerLectureTools(ctx);
   if (options.allowWrites) registerWriteTools(ctx);
 }

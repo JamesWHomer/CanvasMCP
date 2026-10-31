@@ -1,4 +1,5 @@
-// End-to-end check: runs the built server (stdio and HTTP) against a mock Canvas API and a mock file-storage host.
+// End-to-end check: runs the built server (stdio and HTTP) against a mock Canvas API, a mock file-storage host
+// and a mock Echo360 (lecture recordings).
 import assert from "node:assert/strict";
 import { mkdtemp, readFile, readdir, rm, writeFile } from "node:fs/promises";
 import { createServer } from "node:http";
@@ -13,8 +14,8 @@ import { StreamableHTTPClientTransport } from "@modelcontextprotocol/sdk/client/
 import { handleMcpRequest } from "../dist/http.js";
 
 const TOKEN = "test-token";
-const READ_TOOLS = 26;
-const LOCAL_TOOLS = 1; // download_files, stdio server only
+const READ_TOOLS = 28;
+const LOCAL_TOOLS = 2; // download_files and download_lecture_transcripts, stdio server only
 const WRITE_TOOLS = 5;
 const downloadDir = await mkdtemp(join(tmpdir(), "canvas-mcp-downloads-"));
 
@@ -93,6 +94,55 @@ const storage = createServer(async (req, res) => {
   res.end(file);
 });
 
+// ---------- mock Echo360 (reached by following the course's LTI launch) ----------
+
+const SECTION = "11111111-2222-3333-4444-555555555555";
+const echoLog = [];
+const echoLesson = (id, name, medias, extra = {}) => ({
+  type: "SyllabusLessonType",
+  lesson: { lesson: { id, displayName: name, createdAt: "2026-08-01T00:00:00.000Z" }, medias, ...extra },
+});
+const echoSyllabus = [
+  echoLesson("G_abc_2026-08-20T12:05:00.000", "Week 3 Lecture", [{ id: "m1", mediaType: "Video", isAvailable: true }], {
+    startTimeUTC: "2026-08-20T02:05:00.000Z",
+  }),
+  { type: "SyllabusGroupType", groupInfo: { name: "Module 1" }, lessons: [echoLesson("L2", "V01: Intro", [{ id: "m2", isAvailable: true }])] },
+  echoLesson("L3", "Week 13 Lecture", []), // scheduled, not recorded yet
+  echoLesson("L4", "Hidden", [{ id: "m4", isAvailable: false }]),
+];
+const echoCues = [
+  { startMs: 1000, endMs: 3500, speaker: "Speaker 0", content: "Welcome to week three." },
+  { startMs: 3500, endMs: 62000, speaker: "Speaker 1", content: "Today: residuals & <outliers>." },
+  { startMs: 62000, endMs: 65000, speaker: "Speaker 0", content: "Any  questions?" },
+];
+const echo = createServer(async (req, res) => {
+  const url = new URL(req.url, `http://${req.headers.host}`);
+  const body = await readBody(req);
+  echoLog.push({ method: req.method, path: url.pathname, auth: req.headers.authorization, body });
+  const json = (status, data) => {
+    res.writeHead(status, { "content-type": "application/json" });
+    res.end(JSON.stringify(data));
+  };
+  if (req.method === "POST" && url.pathname === "/lti/launch") {
+    res.writeHead(302, { location: `/section/${SECTION}/home`, "set-cookie": "PLAY_SESSION=abc; Path=/; HttpOnly" });
+    return res.end();
+  }
+  // Both mocks share 127.0.0.1, and cookies ignore ports, so Canvas's cookie rides along too.
+  if (!req.headers.cookie?.split("; ").includes("PLAY_SESSION=abc")) {
+    res.writeHead(401, { "content-type": "text/html" });
+    return res.end("<html>Please sign in</html>");
+  }
+  if (url.pathname === `/section/${SECTION}/home`) {
+    res.writeHead(200, { "content-type": "text/html" });
+    return res.end("<html>Recordings</html>");
+  }
+  if (url.pathname === `/section/${SECTION}/syllabus`) return json(200, { status: "ok", message: "", data: echoSyllabus });
+  if (url.pathname === "/api/ui/echoplayer/lessons/G_abc_2026-08-20T12:05:00.000/medias/m1/transcript") {
+    return json(200, { status: "ok", data: { status: "Available", isAutomated: true, contentJSON: { cues: echoCues } } });
+  }
+  json(404, { status: "error", message: "Not found" });
+});
+
 // ---------- mock Canvas ----------
 
 const canvasLog = [];
@@ -106,6 +156,19 @@ const canvas = createServer(async (req, res) => {
     res.writeHead(status, { "content-type": "application/json", ...headers });
     res.end(JSON.stringify(data));
   };
+  // The one-time launch link authenticates with its session_token, not the API token, like a browser would.
+  if (url.pathname === "/courses/101/external_tools/sessionless_launch") {
+    if (url.searchParams.get("session_token") !== "launch-token" || req.headers.authorization) {
+      return send(401, { errors: [{ message: "bad launch" }] });
+    }
+    res.writeHead(200, { "content-type": "text/html", "set-cookie": "canvas_session=s1; path=/" });
+    return res.end(
+      `<form action="${echoOrigin}/lti/launch" method="POST" id="tool_form">` +
+        `<input type="hidden" name="oauth_signature" value="sig&#x3D;&#x3D;">` +
+        `<input type='hidden' name='context_title' value='Bio &amp; &quot;Life&quot;'>` +
+        `</form><script>document.getElementById("tool_form").submit()</script>`,
+    );
+  }
   if (req.headers.authorization !== `Bearer ${TOKEN}`) {
     return send(401, { errors: [{ message: "Invalid access token." }] });
   }
@@ -283,6 +346,18 @@ const canvas = createServer(async (req, res) => {
     },
     "PUT /api/v1/planner/overrides/500": () => send(200, { id: "500", ...body }),
     "POST /api/v1/planner_notes": () => send(201, { id: "600", ...body }),
+    "GET /api/v1/courses/101/tabs": () =>
+      send(200, [
+        { id: "home", label: "Home", type: "internal" },
+        { id: "context_external_tool_7", label: "Zoom", type: "external" },
+        { id: "context_external_tool_8", label: "Recorded Lectures", type: "external" },
+      ]),
+    "GET /api/v1/courses/102/tabs": () => send(200, [{ id: "context_external_tool_7", label: "Zoom", type: "external" }]),
+    "GET /api/v1/courses/101/external_tools/sessionless_launch": () =>
+      url.searchParams.get("id") === "8"
+        ? send(200, { id: "8", name: "Echo360 Cloud", url: `${origin}/courses/101/external_tools/sessionless_launch?session_token=launch-token` })
+        : send(200, { id: "7", name: "Zoom", url: `${origin}/zoom` }),
+    "GET /api/v1/courses/102/external_tools/sessionless_launch": () => send(200, { id: "7", name: "Zoom", url: `${origin}/zoom` }),
   };
   if (req.method === "GET" && url.pathname.match(/^\/files\/\d+\/download$/)) {
     const id = url.pathname.split("/")[2];
@@ -307,6 +382,7 @@ const listen = (server) =>
   new Promise((resolve) => server.listen(0, "127.0.0.1", () => resolve(`http://127.0.0.1:${server.address().port}`)));
 const baseUrl = await listen(canvas);
 const storageOrigin = await listen(storage);
+const echoOrigin = await listen(echo);
 
 // ---------- harness ----------
 
@@ -353,8 +429,11 @@ await check("lists read tools (plus local download) by default, with string ID s
   const getAssignment = tools.find((t) => t.name === "get_assignment");
   assert.equal(getAssignment.inputSchema.properties.course_id.type, "string");
   assert.deepEqual(getAssignment.inputSchema.required.sort(), ["assignment_id", "course_id"]);
-  // download_files writes to the user's disk (not to Canvas), so it isn't read-only.
-  assert.deepEqual(tools.filter((t) => !t.annotations?.readOnlyHint).map((t) => t.name), ["download_files"]);
+  // The download tools write to the user's disk (not to Canvas), so they aren't read-only.
+  assert.deepEqual(tools.filter((t) => !t.annotations?.readOnlyHint).map((t) => t.name), [
+    "download_files",
+    "download_lecture_transcripts",
+  ]);
 });
 
 await check("get_profile", async () => {
@@ -576,6 +655,73 @@ await check("list_quizzes merges Classic and New Quizzes with scores", async () 
   const quiz = await call(client, "get_quiz", { course_id: "101", quiz_id: "9" });
   assert.equal(quiz.data.attempts[0].minutes_spent, 10);
   assert.equal(quiz.data.results_visible, "always");
+});
+
+const launchRequests = () => canvasLog.filter((r) => r.path === "/api/v1/courses/101/external_tools/sessionless_launch");
+
+await check("list_lecture_recordings: launches Echo360 through Canvas, flattens folders, skips unrecorded", async () => {
+  const { data } = await call(client, "list_lecture_recordings", { course_id: "101" });
+  assert.equal(data.source, "Echo360 Cloud");
+  assert.deepEqual(data.recordings, [
+    { recording_id: "m1", title: "Week 3 Lecture", date: "2026-08-20T02:05:00.000Z" },
+    { recording_id: "m2", title: "V01: Intro", group: "Module 1", date: "2026-08-01T00:00:00.000Z" },
+  ]);
+  // The "Recorded Lectures" tab is tried before Zoom, so Zoom is never launched.
+  assert.deepEqual(launchRequests().map((r) => r.query.get("id")), ["8"]);
+  const ltiPost = echoLog.find((r) => r.path === "/lti/launch");
+  assert.equal(new URLSearchParams(ltiPost.body).get("oauth_signature"), "sig==");
+  assert.equal(new URLSearchParams(ltiPost.body).get("context_title"), 'Bio & "Life"');
+  assert.ok(echoLog.every((r) => r.auth === undefined), "the Canvas token must never reach Echo360");
+});
+
+await check("get_lecture_transcript: plain text with a timestamp about once a minute", async () => {
+  const { data } = await call(client, "get_lecture_transcript", { course_id: "101", recording_id: "m1" });
+  assert.equal(data.text, "[0:01] Welcome to week three. Today: residuals & <outliers>.\n\n[1:02] Any questions?");
+  assert.equal(data.duration, "1:05");
+  assert.match(data.note, /speech-recognition/);
+  const paged = await call(client, "get_lecture_transcript", { course_id: "101", recording_id: "m1", max_chars: 1000, offset: 70 });
+  assert.equal(paged.data.text, data.text.slice(70));
+});
+
+await check("get_lecture_transcript: SRT and WebVTT subtitles", async () => {
+  const srt = await call(client, "get_lecture_transcript", { course_id: "101", recording_id: "m1", format: "srt" });
+  assert.equal(
+    srt.data.text,
+    "1\n00:00:01,000 --> 00:00:03,500\nWelcome to week three.\n\n" +
+      "2\n00:00:03,500 --> 00:01:02,000\nToday: residuals & <outliers>.\n\n" +
+      "3\n00:01:02,000 --> 00:01:05,000\nAny questions?\n",
+  );
+  const vtt = await call(client, "get_lecture_transcript", { course_id: "101", recording_id: "m1", format: "vtt" });
+  assert.match(vtt.data.text, /^WEBVTT\n\n00:00:01\.000 --> 00:00:03\.500\nWelcome to week three\.\n\n/);
+  assert.match(vtt.data.text, /residuals &amp; &lt;outliers>\./);
+});
+
+await check("get_lecture_transcript: missing transcripts and unknown IDs explain themselves", async () => {
+  const none = await call(client, "get_lecture_transcript", { course_id: "101", recording_id: "m2" });
+  assert.equal(none.isError, true);
+  assert.match(none.data, /"V01: Intro" has no transcript/);
+  const unknown = await call(client, "get_lecture_transcript", { course_id: "101", recording_id: "m9" });
+  assert.match(unknown.data, /No recording m9 .*list_lecture_recordings/);
+});
+
+await check("list_lecture_recordings: a course without Echo360 says so", async () => {
+  const result = await call(client, "list_lecture_recordings", { course_id: "102" });
+  assert.equal(result.isError, true);
+  assert.match(result.data, /no Echo360/);
+});
+
+await check("download_lecture_transcripts: saves subtitle files, reports failures, reuses one Echo360 session", async () => {
+  const { data } = await call(client, "download_lecture_transcripts", { course_id: "101", format: "vtt" });
+  const dir = join(downloadDir, "Biology transcripts");
+  assert.equal(data.directory, dir);
+  assert.equal(data.saved, 1);
+  assert.equal(data.files[0].path, join(dir, "Week 3 Lecture.vtt"));
+  assert.match(await readFile(data.files[0].path, "utf8"), /^WEBVTT\n\n00:00:01\.000 --> /);
+  assert.match(data.files[1].error, /no transcript/);
+  const again = await call(client, "download_lecture_transcripts", { course_id: "101", recording_ids: ["m1", "nope"] });
+  assert.equal(again.data.files[0].path, join(dir, "Week 3 Lecture.srt"));
+  assert.equal(again.data.files[1].error, "not found in this course");
+  assert.equal(echoLog.filter((r) => r.path === "/lti/launch").length, 1, "one LTI launch serves every call");
 });
 
 await client.close();
@@ -810,6 +956,7 @@ await check("HTTP: fails closed when MCP_ACCESS_KEY is unset", async () => {
 httpServer.close();
 canvas.close();
 storage.close();
+echo.close();
 await rm(downloadDir, { recursive: true });
 console.log(failures ? `\n${failures} check(s) failed` : "\nAll checks passed");
 process.exit(failures ? 1 : 0);

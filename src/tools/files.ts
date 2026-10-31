@@ -19,12 +19,12 @@ const MAX_SAVE_BYTES = 2_000_000_000;
 const SAVE_TIMEOUT_MS = 15 * 60_000;
 const PARALLEL_DOWNLOADS = 4;
 
-function defaultDownloadDir(): string {
+export function defaultDownloadDir(): string {
   return process.env.CANVAS_DOWNLOAD_DIR?.trim() || join(homedir(), "Downloads", "Canvas");
 }
 
 /** Canvas display names can contain characters that aren't valid (or safe) in a file name. */
-function safeFileName(name: string): string {
+export function safeFileName(name: string): string {
   const cleaned = name
     .replace(/[<>:"/\\|?*\u0000-\u001f]/g, "_")
     .replace(/[. ]+$/, "")
@@ -33,7 +33,7 @@ function safeFileName(name: string): string {
 }
 
 /** First "name.ext", "name (1).ext", ... that is neither on disk nor already claimed in this batch. */
-function freePath(dir: string, name: string, claimed: Set<string>): string {
+export function freePath(dir: string, name: string, claimed: Set<string>): string {
   const ext = extname(name);
   const stem = name.slice(0, name.length - ext.length);
   for (let n = 0; ; n++) {
@@ -69,7 +69,7 @@ async function saveResponse(res: Response, path: string): Promise<number> {
   return size;
 }
 
-async function mapLimit<T, R>(items: T[], limit: number, fn: (item: T) => Promise<R>): Promise<R[]> {
+export async function mapLimit<T, R>(items: T[], limit: number, fn: (item: T) => Promise<R>): Promise<R[]> {
   const out = new Array<R>(items.length);
   let next = 0;
   const worker = async () => {
