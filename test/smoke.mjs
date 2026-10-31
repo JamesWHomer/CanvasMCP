@@ -12,9 +12,10 @@ import { Client } from "@modelcontextprotocol/sdk/client/index.js";
 import { StdioClientTransport, getDefaultEnvironment } from "@modelcontextprotocol/sdk/client/stdio.js";
 import { StreamableHTTPClientTransport } from "@modelcontextprotocol/sdk/client/streamableHttp.js";
 import { handleMcpRequest } from "../dist/http.js";
+import { directDownloadUrl } from "../dist/links.js";
 
 const TOKEN = "test-token";
-const READ_TOOLS = 28;
+const READ_TOOLS = 29;
 const LOCAL_TOOLS = 2; // download_files and download_lecture_transcripts, stdio server only
 const WRITE_TOOLS = 5;
 const downloadDir = await mkdtemp(join(tmpdir(), "canvas-mcp-downloads-"));
@@ -89,8 +90,24 @@ const storage = createServer(async (req, res) => {
     res.writeHead(201, { "content-type": "application/json" });
     return res.end(JSON.stringify({ id: "900" }));
   }
-  const file = storageFiles[req.url];
-  res.writeHead(file ? 200 : 404);
+  if (req.method === "POST" && req.url === "/upload-link") {
+    res.writeHead(201, { "content-type": "application/json" });
+    return res.end("{}");
+  }
+  if (req.url === "/page") {
+    res.writeHead(200, { "content-type": "text/html; charset=utf-8" });
+    return res.end("<html>Sign in to continue</html>");
+  }
+  if (req.url === "/download?id=abc") {
+    res.writeHead(206, {
+      "content-type": "application/pdf",
+      "content-range": "bytes 0-0/173000000",
+      "content-disposition": `attachment; filename="lab report.pdf"; filename*=UTF-8''lab%20report.pdf`,
+    });
+    return res.end("%");
+  }
+  const file = storageFiles[req.url.split("?")[0]];
+  res.writeHead(file ? 200 : 404, file ? { "content-length": file.length } : {});
   res.end(file);
 });
 
@@ -147,6 +164,7 @@ const echo = createServer(async (req, res) => {
 
 const canvasLog = [];
 let overrides = [];
+let progressPolls = 0;
 const canvas = createServer(async (req, res) => {
   const url = new URL(req.url, `http://${req.headers.host}`);
   const raw = await readBody(req);
@@ -245,6 +263,7 @@ const canvas = createServer(async (req, res) => {
         { id: "10", name: "Lab report", due_at: future },
         { id: "20", name: "Weekly check", is_quiz_lti_assignment: true, due_at: future, points_possible: 5 },
         { id: "21", name: "Quiz 1", quiz_id: "9", submission: { score: 8, workflow_state: "graded" } },
+        { id: "11", name: "Group project", group_category_id: "77", due_at: future },
       ]),
     "GET /api/v1/courses/101/assignments/10": () =>
       send(200, {
@@ -257,19 +276,65 @@ const canvas = createServer(async (req, res) => {
         submission_types: ["online_upload", "online_text_entry"],
         allowed_extensions: ["pdf", "txt"],
         html_url: `${origin}/courses/101/assignments/10`,
-        rubric: [{ id: "c1", description: "Clarity", points: 10, ratings: [{ points: 10, description: "Clear" }] }],
+        rubric: [
+          {
+            id: "c1",
+            description: "Clarity",
+            // Pasted HTML that Canvas escaped again on each save.
+            long_description: "Use headings&amp;amp;amp;amp;nbsp;and lists<br/>\r\n<br/>Cite &amp;amp;quot;sources&amp;amp;quot;",
+            points: 10,
+            ratings: [{ points: 10, description: "Clear", long_description: "No jargon &amp;amp;amp; well structured" }],
+          },
+        ],
       }),
     "GET /api/v1/courses/101/assignments/10/submissions/self": () =>
       send(200, {
+        user_id: "1",
         workflow_state: "graded",
+        submission_type: "online_upload",
         score: 18,
-        attempt: 1,
+        attempt: 2,
         submitted_at: "2026-10-01T00:00:00Z",
+        attachments: [
+          { id: "800", display_name: "lab.pdf", size: 2048, "content-type": "application/pdf", upload_status: "success" },
+        ],
+        submission_history: [
+          { attempt: 2, submitted_at: "2026-10-01T00:00:00Z", score: 18, attachments: [{ display_name: "lab.pdf" }] },
+          { attempt: 1, submitted_at: "2026-09-30T00:00:00Z", attachments: [{ display_name: "draft.pdf" }] },
+        ],
         submission_comments: [{ author_name: "Prof", created_at: "2026-10-01T00:00:00Z", comment: "Nice work" }],
         rubric_assessment: { c1: { points: 8, comments: "Mostly clear" } },
       }),
     "POST /api/v1/courses/101/assignments/10/submissions/self/files": () =>
-      send(200, { upload_url: `${storageOrigin}/upload`, upload_params: { key: "upload-key" } }),
+      body.url
+        ? send(200, {
+            upload_url: `${storageOrigin}/upload-link`,
+            upload_params: { key: "link-key", target_url: body.url },
+            progress: { id: body.url.includes("broken") ? "2" : "1", workflow_state: "queued" },
+          })
+        : send(200, { upload_url: `${storageOrigin}/upload`, upload_params: { key: "upload-key" } }),
+    "GET /api/v1/progress/1": () =>
+      send(200, ++progressPolls % 2 ? { id: "1", workflow_state: "running" } : { id: "1", workflow_state: "completed", results: { id: "901" } }),
+    "GET /api/v1/progress/2": () => send(200, { id: "2", workflow_state: "failed", message: "Remote server returned 403" }),
+    "GET /api/v1/courses/101/assignments/11": () =>
+      send(200, {
+        id: "11",
+        name: "Group project",
+        due_at: future,
+        allowed_attempts: -1,
+        submission_types: ["online_upload"],
+        group_category_id: "77",
+        html_url: `${origin}/courses/101/assignments/11`,
+      }),
+    "GET /api/v1/courses/101/assignments/11/submissions/self": () =>
+      send(200, {
+        user_id: "1",
+        workflow_state: "submitted",
+        attempt: 1,
+        submitted_at: "2026-10-20T00:00:00Z",
+        attachments: [{ id: "950", display_name: "project.zip", size: 5000, upload_status: "success" }],
+      }),
+    "GET /api/v1/files/950": () => send(200, { id: "950", display_name: "project.zip", user: { id: "4", display_name: "Ash" } }),
     "POST /api/v1/courses/101/assignments/10/submissions": () =>
       send(201, { submitted_at: "2026-10-30T10:00:00Z", attempt: 2, late: false }),
     "GET /api/v1/courses/101/modules": () =>
@@ -327,7 +392,7 @@ const canvas = createServer(async (req, res) => {
       ]),
     "GET /api/v1/users/self/groups": () =>
       send(200, [
-        { id: "7", name: "Team Rocket", course_id: "101", members_count: 2 },
+        { id: "7", name: " Team Rocket", course_id: "101", group_category_id: "77", members_count: 2 },
         { id: "8", name: "Old team", course_id: "50", members_count: 3 },
       ]),
     "GET /api/v1/groups/7/users": () => send(200, [{ id: "1", name: "Test Student" }, { id: "4", name: "Ash" }]),
@@ -456,6 +521,12 @@ await check("get_planner makes links absolute", async () => {
   assert.equal(data[0].status.submitted, false);
 });
 
+await check("timestamps come back in the user's time zone, with its offset", async () => {
+  const { data } = await call(client, "get_planner", { course_id: 101 });
+  // 03:59 UTC on 2 Nov is the evening before in New York, which left daylight saving on 1 Nov.
+  assert.equal(data[0].due_at, "2026-11-01T22:59:00-05:00");
+});
+
 await check("get_planner reads bare dates as whole days in the user's time zone", async () => {
   await call(client, "get_planner", { start_date: "2026-11-03", end_date: "2026-11-05" });
   const req = lastRequest("GET", "/api/v1/planner/items");
@@ -472,6 +543,43 @@ await check("get_assignment converts HTML and merges rubric marks", async () => 
   assert.equal(data.rubric[0].your_points, 8);
   assert.equal(data.submission.score, 18);
   assert.equal(data.submission.comments[0].comment, "Nice work");
+  assert.equal(data.submission.files[0].name, "lab.pdf");
+  assert.equal(data.group, undefined);
+});
+
+await check("get_assignment undoes repeated escaping in rubric text", async () => {
+  const { data } = await call(client, "get_assignment", { course_id: "101", assignment_id: "10" });
+  assert.equal(data.rubric[0].details, 'Use headings and lists\n\nCite "sources"');
+  assert.deepEqual(data.rubric[0].ratings, ["10 pts: Clear (No jargon & well structured)"]);
+});
+
+await check("get_submission: status, files, attempt history and comments without the brief", async () => {
+  const { data } = await call(client, "get_submission", { course_id: "101", assignment_id: "10" });
+  assert.equal(data.assignment, "Lab report");
+  assert.equal(data.description, undefined);
+  assert.equal(data.submitted_at, "2026-09-30T20:00:00-04:00");
+  assert.deepEqual(data.files, [
+    { file_id: "800", name: "lab.pdf", size: 2048, type: "application/pdf", upload_status: "success" },
+  ]);
+  assert.deepEqual(data.history.map((h) => [h.attempt, h.files[0]]), [[1, "draft.pdf"], [2, "lab.pdf"]]);
+  assert.equal(data.attempts_allowed, "unlimited");
+  assert.equal(data.comments[0].comment, "Nice work");
+  assert.deepEqual(lastRequest("GET", "/api/v1/courses/101/assignments/10/submissions/self").query.getAll("include[]"), [
+    "submission_history",
+    "submission_comments",
+  ]);
+});
+
+await check("get_submission: group assignments name the group and who uploaded the files", async () => {
+  const { data } = await call(client, "get_submission", { course_id: "101", assignment_id: "11" });
+  assert.equal(data.group.name, "Team Rocket");
+  assert.match(data.group.note, /whole group/);
+  assert.equal(data.uploaded_by, "Ash");
+  assert.deepEqual(lastRequest("GET", "/api/v1/files/950").query.getAll("include[]"), ["user"]);
+  const assignment = await call(client, "get_assignment", { course_id: "101", assignment_id: "11" });
+  assert.equal(assignment.data.group.name, "Team Rocket");
+  const list = await call(client, "list_assignments", { course_id: "101" });
+  assert.deepEqual(list.data.filter((a) => a.group_assignment).map((a) => a.id), ["11"]);
 });
 
 await check("list_modules fetches items_url for large modules", async () => {
@@ -612,12 +720,14 @@ await check("list_course_people defaults to teaching staff", async () => {
   assert.deepEqual(data.map((p) => p.roles[0]), ["Teacher", "Ta"]);
 });
 
-await check("list_my_groups: current courses only, with members", async () => {
+await check("list_my_groups: current courses only, trimmed names, with members", async () => {
   const { data } = await call(client, "list_my_groups");
   assert.deepEqual(data.map((g) => g.name), ["Team Rocket"]);
   assert.deepEqual(data[0].members.map((m) => m.name), ["Test Student", "Ash"]);
   const all = await call(client, "list_my_groups", { include_past: true });
   assert.equal(all.data.length, 2);
+  const one = await call(client, "list_my_groups", { course_id: "50" });
+  assert.deepEqual(one.data.map((g) => g.name), ["Old team"]);
 });
 
 await check("calculate_grade: weights, drop rules, projections and target", async () => {
@@ -663,8 +773,8 @@ await check("list_lecture_recordings: launches Echo360 through Canvas, flattens 
   const { data } = await call(client, "list_lecture_recordings", { course_id: "101" });
   assert.equal(data.source, "Echo360 Cloud");
   assert.deepEqual(data.recordings, [
-    { recording_id: "m1", title: "Week 3 Lecture", date: "2026-08-20T02:05:00.000Z" },
-    { recording_id: "m2", title: "V01: Intro", group: "Module 1", date: "2026-08-01T00:00:00.000Z" },
+    { recording_id: "m1", title: "Week 3 Lecture", date: "2026-08-19T22:05:00-04:00" },
+    { recording_id: "m2", title: "V01: Intro", group: "Module 1", date: "2026-07-31T20:00:00-04:00" },
   ]);
   // The "Recorded Lectures" tab is tried before Zoom, so Zoom is never launched.
   assert.deepEqual(launchRequests().map((r) => r.query.get("id")), ["8"]);
@@ -762,7 +872,7 @@ await check("submit_assignment: preview submits nothing", async () => {
     files: [{ name: "report.txt", text: "My report" }],
   });
   assert.match(data.status, /PREVIEW/);
-  assert.equal(data.attempt, "2 of unlimited");
+  assert.equal(data.attempt, "3 of unlimited");
   assert.equal(data.replaces_existing_submission.score, 18);
   assert.equal(posts(SUBMIT).length, before);
   assert.equal(posts(`${SUBMIT}/self/files`).length, 0);
@@ -813,6 +923,114 @@ await check("submit_assignment: text entry becomes HTML paragraphs", async () =>
     confirm: true,
   });
   assert.equal(posts(SUBMIT).at(-1).body.submission.body, "<p>Para &lt;one&gt;<br>line two</p>\n<p>Para two</p>");
+});
+
+await check("share links become direct downloads", async () => {
+  assert.equal(
+    directDownloadUrl("https://drive.google.com/file/d/AbC_12-3/view?usp=sharing").toString(),
+    "https://drive.usercontent.google.com/download?id=AbC_12-3&export=download&confirm=t",
+  );
+  assert.equal(
+    directDownloadUrl("https://drive.google.com/open?id=XyZ").toString(),
+    "https://drive.usercontent.google.com/download?id=XyZ&export=download&confirm=t",
+  );
+  assert.equal(
+    directDownloadUrl("https://www.dropbox.com/scl/fi/abc/report.zip?rlkey=k&dl=0").toString(),
+    "https://www.dropbox.com/scl/fi/abc/report.zip?rlkey=k&dl=1",
+  );
+  assert.equal(directDownloadUrl("https://example.com/a.zip").toString(), "https://example.com/a.zip");
+});
+
+await check("submit_assignment: link preview checks the file without uploading anything", async () => {
+  const before = posts(`${SUBMIT}/self/files`).length;
+  const { data } = await call(writer, "submit_assignment", {
+    course_id: "101",
+    assignment_id: "10",
+    files: [{ url: `${storageOrigin}/download?id=abc` }],
+  });
+  assert.match(data.status, /PREVIEW/);
+  const host = new URL(storageOrigin).host;
+  assert.deepEqual(data.files, [`lab report.pdf (application/pdf, 173,000,000 bytes, Canvas will download it from ${host})`]);
+  assert.equal(posts(`${SUBMIT}/self/files`).length, before);
+});
+
+await check("submit_assignment: a link that opens a web page is refused", async () => {
+  const result = await call(writer, "submit_assignment", {
+    course_id: "101",
+    assignment_id: "10",
+    files: [{ url: `${storageOrigin}/page`, name: "report.pdf" }],
+  });
+  assert.equal(result.isError, true);
+  assert.match(result.data, /opens a web page, not the file/);
+});
+
+await check("submit_assignment: confirmed link upload has Canvas download it, waits, then submits", async () => {
+  storageLog.length = 0;
+  const link = `${storageOrigin}/blob/slides.pdf`;
+  const { data } = await call(writer, "submit_assignment", {
+    course_id: "101",
+    assignment_id: "10",
+    files: [{ url: link }],
+    confirm: true,
+  });
+  assert.equal(data.status, "SUBMITTED");
+  assert.deepEqual(posts(`${SUBMIT}/self/files`).at(-1).body, {
+    url: link,
+    name: "slides.pdf",
+    size: storageFiles["/blob/slides.pdf"].length,
+    content_type: "application/pdf",
+    on_duplicate: "rename",
+    submit_assignment: false,
+  });
+  const start = storageLog.find((r) => r.path === "/upload-link");
+  assert.equal(start.auth, undefined);
+  assert.match(start.body, /link-key/);
+  assert.doesNotMatch(start.body, /filename=/);
+  assert.ok(canvasLog.filter((r) => r.path === "/api/v1/progress/1").length >= 2, "polls until completed");
+  assert.deepEqual(posts(SUBMIT).at(-1).body.submission.file_ids, ["901"]);
+});
+
+await check("submit_assignment: a failed link download submits nothing", async () => {
+  const before = posts(SUBMIT).length;
+  const result = await call(writer, "submit_assignment", {
+    course_id: "101",
+    assignment_id: "10",
+    files: [{ url: `${storageOrigin}/blob/notes.txt?broken=1` }],
+    confirm: true,
+  });
+  assert.equal(result.isError, true);
+  assert.match(result.data, /couldn't download notes\.txt: Remote server returned 403/);
+  assert.equal(posts(SUBMIT).length, before);
+});
+
+await check("submit_assignment: an existing Canvas file is submitted by ID without re-uploading", async () => {
+  const preview = await call(writer, "submit_assignment", { course_id: "101", assignment_id: "10", files: [{ file_id: 58 }] });
+  assert.deepEqual(preview.data.files, ["notes.txt (text/plain, 1,000 bytes, Canvas file 58)"]);
+  const uploads = posts(`${SUBMIT}/self/files`).length;
+  await call(writer, "submit_assignment", { course_id: "101", assignment_id: "10", files: [{ file_id: "58" }], confirm: true });
+  assert.deepEqual(posts(SUBMIT).at(-1).body.submission.file_ids, ["58"]);
+  assert.equal(posts(`${SUBMIT}/self/files`).length, uploads);
+});
+
+await check("submit_assignment: group preview names the group and the teammate's submission it replaces", async () => {
+  const { data } = await call(writer, "submit_assignment", {
+    course_id: "101",
+    assignment_id: "11",
+    files: [{ name: "v2.zip", base64: "UEsDBA==" }],
+  });
+  assert.match(data.status, /PREVIEW/);
+  assert.equal(data.group.name, "Team Rocket");
+  assert.deepEqual(data.replaces_existing_submission.files, ["project.zip"]);
+  assert.equal(data.replaces_existing_submission.uploaded_by, "Ash");
+});
+
+await check("submit_assignment: each file needs exactly one source", async () => {
+  const result = await call(writer, "submit_assignment", {
+    course_id: "101",
+    assignment_id: "10",
+    files: [{ name: "a.txt", text: "x", file_id: "58" }],
+  });
+  assert.match(result.data, /exactly one of text, base64, url, file_id or path/);
 });
 
 await check("submit_assignment: the local server can upload a file from disk", async () => {

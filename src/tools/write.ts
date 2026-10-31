@@ -1,16 +1,28 @@
 // Tools that change things in Canvas. Registered only when CANVAS_ALLOW_WRITES is on.
 // Anything other people see (submissions, discussion posts, messages) is two-step: a call without
 // confirm: true only returns a preview, so the user can check it before it's sent.
-import { readFile } from "node:fs/promises";
+import { openAsBlob } from "node:fs";
 import { basename, extname } from "node:path";
 import { z } from "zod";
-import type { UploadFile } from "../canvas.js";
+import { UploadPending, type CanvasClient } from "../canvas.js";
 import { compact, textToHtml, truncate } from "../format.js";
-import { courseId, resolveRange, run, submissionSummary, type Obj, type ToolContext } from "./shared.js";
+import { probeLink } from "../links.js";
+import {
+  assignmentGroup,
+  courseId,
+  groupInfo,
+  resolveRange,
+  submissionSummary,
+  uploadedBy,
+  type Obj,
+  type ToolContext,
+} from "./shared.js";
 
 const OUTWARD = { readOnlyHint: false, destructiveHint: true, openWorldHint: true } as const;
 const PERSONAL = { readOnlyHint: false, destructiveHint: false, idempotentHint: true, openWorldHint: true } as const;
-const MAX_UPLOAD_BYTES = 100_000_000;
+const MAX_UPLOAD_BYTES = 2_000_000_000;
+// How long a confirmed submission waits for Canvas to download linked files; within Vercel's function time limit.
+const LINK_WAIT_MS = 150_000;
 
 const confirm = z
   .boolean()
@@ -41,52 +53,115 @@ function contentTypeFor(name: string): string {
 }
 
 const fileInput = z.object({
-  name: z.string().optional().describe("File name including extension, e.g. report.pdf (required unless path is given)"),
-  text: z.string().optional().describe("File contents as text, for text/code files"),
-  base64: z.string().optional().describe("File contents, base64-encoded, for binary files"),
-  path: z.string().optional().describe("Path to a file on the user's computer (local server only)"),
+  name: z
+    .string()
+    .optional()
+    .describe("File name including extension, e.g. report.pdf (required for text and base64; otherwise taken from the source)"),
+  text: z.string().optional().describe("File contents as text, for small text/code files"),
+  base64: z.string().optional().describe("File contents, base64-encoded, for small binary files"),
+  url: z
+    .string()
+    .optional()
+    .describe(
+      "Public download link; Canvas downloads the file itself, so any size works. Google Drive and Dropbox share links are converted automatically; the file must be shared so anyone with the link can view it.",
+    ),
+  file_id: z.coerce
+    .string()
+    .optional()
+    .describe("ID of a file already in the user's own Canvas files (or their group's, for a group assignment)"),
+  path: z.string().optional().describe("Path to a file on the user's computer, any size (local server only)"),
 });
 
-async function loadFiles(files: z.infer<typeof fileInput>[], allowLocalFiles: boolean): Promise<UploadFile[]> {
+type Prepared = { name: string; contentType: string; size?: number } & (
+  | { source: "content"; data: Blob }
+  | { source: "link"; url: string }
+  | { source: "canvas"; fileId: string }
+);
+
+/** Resolves each file to what will be uploaded, checking it without uploading anything. */
+async function prepareFiles(
+  c: CanvasClient,
+  files: z.infer<typeof fileInput>[],
+  allowLocalFiles: boolean,
+): Promise<Prepared[]> {
   return Promise.all(
-    files.map(async (f) => {
-      let bytes: Uint8Array<ArrayBuffer>;
-      let name = f.name;
-      if (f.path) {
-        if (!allowLocalFiles) {
-          throw new Error("path only works with the local Canvas server; pass the contents as text or base64 instead");
-        }
-        bytes = new Uint8Array(await readFile(f.path));
-        name ??= basename(f.path);
-      } else if (f.base64 !== undefined) {
-        bytes = new Uint8Array(Buffer.from(f.base64, "base64"));
-      } else if (f.text !== undefined) {
-        bytes = new TextEncoder().encode(f.text);
-      } else {
-        throw new Error("Each file needs one of text, base64 or path");
+    files.map(async (f): Promise<Prepared> => {
+      const sources = [f.text, f.base64, f.url, f.file_id, f.path].filter((x) => x !== undefined).length;
+      if (sources !== 1) throw new Error("Each file needs exactly one of text, base64, url, file_id or path");
+
+      if (f.file_id !== undefined) {
+        const meta = await c.get<Obj>(`files/${f.file_id}`);
+        const name: string = meta.display_name ?? meta.filename ?? `file-${f.file_id}`;
+        return {
+          source: "canvas",
+          fileId: String(meta.id),
+          name,
+          size: meta.size,
+          contentType: meta["content-type"] ?? contentTypeFor(name),
+        };
       }
-      if (!name) throw new Error("Each file needs a name");
-      if (bytes.length === 0) throw new Error(`${name} is empty`);
-      if (bytes.length > MAX_UPLOAD_BYTES) throw new Error(`${name} is over ${MAX_UPLOAD_BYTES / 1e6} MB`);
-      return { name, bytes, contentType: contentTypeFor(name) };
+
+      if (f.url !== undefined) {
+        const link = await probeLink(f.url, c.origin.startsWith("http:"));
+        const name = f.name ?? link.name;
+        if (!name) throw new Error(`Give a name (with extension) for ${f.url}`);
+        if (link.contentType === "text/html" && !/\.html?$/i.test(name)) {
+          throw new Error(
+            `${f.url} opens a web page, not the file. Use a direct download link, shared so anyone with the link can view it.`,
+          );
+        }
+        return { source: "link", url: link.url, name, size: link.size, contentType: contentTypeFor(name) };
+      }
+
+      let data: Blob;
+      let name = f.name;
+      if (f.path !== undefined) {
+        if (!allowLocalFiles) {
+          throw new Error("path only works with the local Canvas server; use url, file_id, or text/base64 for small files");
+        }
+        name ??= basename(f.path);
+        // Read from disk as it uploads, rather than into memory.
+        data = await openAsBlob(f.path, { type: contentTypeFor(name) });
+      } else {
+        if (!name) throw new Error("Each text or base64 file needs a name");
+        const bytes = f.base64 !== undefined ? Buffer.from(f.base64, "base64") : Buffer.from(f.text!, "utf8");
+        data = new Blob([bytes], { type: contentTypeFor(name) });
+      }
+      if (data.size === 0) throw new Error(`${name} is empty`);
+      if (data.size > MAX_UPLOAD_BYTES) throw new Error(`${name} is over ${MAX_UPLOAD_BYTES / 1e9} GB`);
+      return { source: "content", data, name, size: data.size, contentType: contentTypeFor(name) };
     }),
   );
 }
 
-export function registerWriteTools({ server, canvas, allowLocalFiles }: ToolContext): void {
+function describeFile(f: Prepared): string {
+  const size = f.size === undefined ? "size unknown" : `${f.size.toLocaleString()} bytes`;
+  const from =
+    f.source === "link"
+      ? `, Canvas will download it from ${new URL(f.url).host}`
+      : f.source === "canvas"
+        ? `, Canvas file ${f.fileId}`
+        : "";
+  return `${f.name} (${f.contentType}, ${size}${from})`;
+}
+
+export function registerWriteTools({ server, canvas, allowLocalFiles, run }: ToolContext): void {
   server.registerTool(
     "submit_assignment",
     {
       title: "Submit an assignment",
       description:
-        "Submit work for an assignment: text entry, a website URL, or file uploads. ALWAYS two steps: first call without confirm to get a preview (which also flags lateness, attempts left and allowed file types), show it to the user, and call again with the same arguments plus confirm: true only once they approve. Files can be given as text, base64" +
-        (allowLocalFiles ? ", or a path on the user's computer." : "."),
+        "Submit work for an assignment: text entry, a website URL, or files. ALWAYS two steps: first call without confirm to get a preview (which also flags lateness, attempts left, allowed file types, and for group assignments the group and any teammate's submission it would replace), show it to the user, and call again with the same arguments plus confirm: true only once they approve. Each file comes from one of: url (a public download link that Canvas downloads itself, for files of any size), file_id (a file already in the user's Canvas files)" +
+        (allowLocalFiles ? ", path (a file on the user's computer, any size)" : "") +
+        ", or text/base64 contents (small files only" +
+        (allowLocalFiles ? "" : ": this server accepts about 3 MB per request") +
+        ").",
       inputSchema: {
         course_id: courseId,
         assignment_id: z.coerce.string().describe("Assignment ID"),
         text: z.string().optional().describe("Text-entry submission body (plain text; paragraphs separated by blank lines)"),
-        url: z.string().url().optional().describe("Website URL submission"),
-        files: z.array(fileInput).optional().describe("Files to upload as the submission"),
+        url: z.string().url().optional().describe("Website URL submission (for a file, use files[].url instead)"),
+        files: z.array(fileInput).optional().describe("Files to submit"),
         comment: z.string().optional().describe("Optional comment to the marker"),
         confirm,
       },
@@ -104,7 +179,11 @@ export function registerWriteTools({ server, canvas, allowLocalFiles }: ToolCont
           c.get<Obj>(base),
           c.get<Obj>(`${base}/submissions/self`).catch(() => undefined),
         ]);
-        const uploads = files?.length ? await loadFiles(files, allowLocalFiles) : [];
+        const [uploads, group, existingBy] = await Promise.all([
+          files?.length ? prepareFiles(c, files, allowLocalFiles) : [],
+          assignmentGroup(c, a),
+          a.group_category_id && current?.submitted_at && !confirm ? uploadedBy(c, current) : undefined,
+        ]);
 
         const problems: string[] = [];
         const allowed: string[] = a.submission_types ?? [];
@@ -134,18 +213,52 @@ export function registerWriteTools({ server, canvas, allowLocalFiles }: ToolCont
             due_at: a.due_at,
             will_be_late: late || undefined,
             attempt: `${used + 1} of ${a.allowed_attempts > 0 ? a.allowed_attempts : "unlimited"}`,
-            replaces_existing_submission: current?.submitted_at ? submissionSummary(current) : undefined,
+            group: groupInfo(a, group),
+            replaces_existing_submission: current?.submitted_at
+              ? compact({
+                  ...submissionSummary(current),
+                  files: current.attachments?.map((f: Obj) => f.display_name),
+                  uploaded_by: existingBy,
+                })
+              : undefined,
             submission_type: type,
             text: truncate(text, 1500),
             url,
-            files: uploads.map((u) => `${u.name} (${u.contentType}, ${u.bytes.length.toLocaleString()} bytes)`),
+            files: uploads.map(describeFile),
             comment,
             next_step: "Show this preview to the user. Only if they approve, call again with confirm: true.",
           });
         }
 
-        const fileIds = [];
-        for (const u of uploads) fileIds.push(await c.uploadSubmissionFile(course_id, assignment_id, u));
+        // Uploads run side by side, so Canvas downloads linked files in parallel.
+        const results = await Promise.allSettled(
+          uploads.map((u) =>
+            u.source === "canvas"
+              ? Promise.resolve(u.fileId)
+              : u.source === "link"
+                ? c.uploadSubmissionFileFromUrl(course_id, assignment_id, u, LINK_WAIT_MS)
+                : c.uploadSubmissionFile(course_id, assignment_id, u),
+          ),
+        );
+        const failure = results.find((r) => r.status === "rejected" && !(r.reason instanceof UploadPending));
+        if (failure?.status === "rejected") throw failure.reason;
+        const pending = results.flatMap((r, i) =>
+          r.status === "rejected" ? [{ name: uploads[i].name, progress_id: (r.reason as UploadPending).progressId }] : [],
+        );
+        if (pending.length) {
+          return compact({
+            status: "NOT SUBMITTED YET: Canvas is still downloading from the link",
+            assignment: a.name,
+            ready: results.flatMap((r, i) => (r.status === "fulfilled" ? [{ name: uploads[i].name, file_id: r.value }] : [])),
+            still_downloading: pending,
+            next_step:
+              "Nothing has been submitted. Poll canvas_api_get with path progress/<progress_id> until workflow_state is " +
+              "completed; results.id is then that file's file_id. Then call submit_assignment again with confirm: true and " +
+              "files: [{ file_id }] for every file above (the same files the user approved).",
+          });
+        }
+
+        const fileIds = results.map((r) => (r as PromiseFulfilledResult<string>).value);
         const submission = await c.post<Obj>(`${base}/submissions`, {
           submission: compact({
             submission_type: type,
@@ -161,6 +274,7 @@ export function registerWriteTools({ server, canvas, allowLocalFiles }: ToolCont
           submitted_at: submission.submitted_at,
           attempt: submission.attempt,
           late: submission.late || undefined,
+          for_group: group?.name?.trim(),
           files: uploads.map((u) => u.name),
           url: a.html_url,
         });

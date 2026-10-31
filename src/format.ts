@@ -11,6 +11,30 @@ export function htmlToMarkdown(html: string | null | undefined): string | undefi
   return md || undefined;
 }
 
+const ENTITIES: Record<string, string> = { amp: "&", lt: "<", gt: ">", quot: '"', apos: "'", nbsp: " " };
+
+function decodeEntities(text: string): string {
+  return text.replace(/&(#x[0-9a-f]+|#\d+|[a-z]+);/gi, (match, entity: string) => {
+    if (entity[0] !== "#") return ENTITIES[entity.toLowerCase()] ?? match;
+    const code = entity[1].toLowerCase() === "x" ? parseInt(entity.slice(2), 16) : Number(entity.slice(1));
+    return code > 0 && code <= 0x10ffff ? String.fromCodePoint(code) : match;
+  });
+}
+
+/**
+ * Rubric text is stored as plain text, but often holds pasted HTML that Canvas escaped again on every save
+ * (&amp;amp;amp;). Undoes the repeated escaping, then converts any HTML to Markdown.
+ */
+export function richTextToMarkdown(text: string | null | undefined): string | undefined {
+  if (!text) return undefined;
+  let s = text;
+  while (s.includes("&amp;")) s = s.replaceAll("&amp;", "&");
+  s = decodeEntities(s);
+  if (/<\/?[a-z][a-z0-9]*(\s[^>]*)?\/?>/i.test(s)) s = htmlToMarkdown(s)?.replace(/[ \t]+\n/g, "\n") ?? "";
+  const out = s.replace(/\r\n?/g, "\n").replace(/[ \t]+\n/g, "\n").replace(/\n{3,}/g, "\n\n").trim();
+  return out || undefined;
+}
+
 /** Plain text to Canvas rich-content HTML: blank lines separate paragraphs, single newlines become <br>. */
 export function textToHtml(text: string): string {
   const escape = (s: string) => s.replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;");

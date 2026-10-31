@@ -7,6 +7,8 @@ export type Params = Record<string, ParamValue>;
 const DEFAULT_MAX_ITEMS = 500;
 const REQUEST_TIMEOUT_MS = 30_000;
 const TRANSFER_TIMEOUT_MS = 120_000;
+const UPLOAD_TIMEOUT_MS = 15 * 60_000;
+const PROGRESS_POLL_MS = 1_000;
 const MAX_REDIRECTS = 5;
 
 export class CanvasError extends Error {
@@ -19,9 +21,25 @@ export class CanvasError extends Error {
   }
 }
 
+/** Canvas is still fetching a file from a link; its Progress object (GET progress/<id>) reports when it's done. */
+export class UploadPending extends CanvasError {
+  constructor(readonly progressId: string) {
+    super(`Canvas is still fetching the file (progress ${progressId})`);
+    this.name = "UploadPending";
+  }
+}
+
 export interface UploadFile {
   name: string;
-  bytes: Uint8Array<ArrayBuffer>;
+  /** May be backed by a file on disk (fs.openAsBlob), so large files are streamed rather than held in memory. */
+  data: Blob;
+  contentType: string;
+}
+
+export interface LinkedFile {
+  name: string;
+  url: string;
+  size?: number;
   contentType: string;
 }
 
@@ -118,22 +136,11 @@ export class CanvasClient {
     // Step 1: tell Canvas about the file; it answers with where and how to upload it.
     const ticket = await this.post<{ upload_url: string; upload_params: Record<string, string>; file_param?: string }>(
       `courses/${courseId}/assignments/${assignmentId}/submissions/self/files`,
-      { name: file.name, size: file.bytes.length, content_type: file.contentType, on_duplicate: "rename" },
+      { name: file.name, size: file.data.size, content_type: file.contentType, on_duplicate: "rename" },
     );
 
     // Step 2: multipart POST to the storage host. Upload params go first; the token is not sent off-host.
-    const uploadUrl = new URL(ticket.upload_url);
-    this.assertTransferUrl(uploadUrl);
-    const form = new FormData();
-    for (const [key, value] of Object.entries(ticket.upload_params ?? {})) form.append(key, value);
-    form.append(ticket.file_param ?? "file", new Blob([file.bytes], { type: file.contentType }), file.name);
-    const res = await this.send(uploadUrl, {
-      method: "POST",
-      body: form,
-      redirect: "manual",
-      headers: uploadUrl.origin === this.origin ? { Authorization: `Bearer ${this.token}` } : {},
-      signal: AbortSignal.timeout(TRANSFER_TIMEOUT_MS),
-    });
+    const { res, uploadUrl } = await this.postToStorage(ticket, UPLOAD_TIMEOUT_MS, file);
 
     // Step 3: the storage host either returns the file JSON or points back at Canvas to confirm it.
     const text = await res.text();
@@ -148,6 +155,77 @@ export class CanvasClient {
     if (!location) throw new CanvasError(`File upload returned status ${res.status} without a file ID`);
     const confirmed = await this.get<{ id: string | number }>(new URL(location, uploadUrl).toString());
     return String(confirmed.id);
+  }
+
+  /**
+   * Has Canvas download a public link into the user's submission attachments, so the file never passes through
+   * this server, and returns the new file's ID. Throws UploadPending if Canvas hasn't finished within waitMs.
+   */
+  async uploadSubmissionFileFromUrl(
+    courseId: string,
+    assignmentId: string,
+    file: LinkedFile,
+    waitMs: number,
+  ): Promise<string> {
+    // submit_assignment defaults to true, which would submit as soon as the file arrives; we submit ourselves.
+    const ticket = await this.post<{
+      upload_url?: string;
+      upload_params?: Record<string, string>;
+      progress?: { id: string | number };
+    }>(`courses/${courseId}/assignments/${assignmentId}/submissions/self/files`, {
+      url: file.url,
+      name: file.name,
+      size: file.size,
+      content_type: file.contentType,
+      on_duplicate: "rename",
+      submit_assignment: false,
+    });
+    // Current Canvas wants the upload params posted to the storage host, without a file, to start the fetch.
+    // Older Canvas starts fetching on its own and returns no upload_url.
+    if (ticket.upload_url) {
+      const { res } = await this.postToStorage(ticket as { upload_url: string }, TRANSFER_TIMEOUT_MS);
+      const text = await res.text();
+      if (res.status >= 400) throw new CanvasError(`Starting the upload failed with status ${res.status}: ${text.slice(0, 300)}`);
+    }
+    if (ticket.progress?.id === undefined) throw new CanvasError("Canvas didn't return progress for the link upload");
+    const progressId = String(ticket.progress.id);
+
+    const deadline = Date.now() + waitMs;
+    for (;;) {
+      const p = await this.get<{ workflow_state: string; message?: string; results?: { id?: string | number } }>(
+        `progress/${progressId}`,
+      );
+      if (p.workflow_state === "completed") {
+        if (p.results?.id === undefined) throw new CanvasError("Canvas finished the link upload but returned no file ID");
+        return String(p.results.id);
+      }
+      if (p.workflow_state === "failed") {
+        throw new CanvasError(`Canvas couldn't download ${file.name}: ${p.message || "no reason given"}`);
+      }
+      if (Date.now() + PROGRESS_POLL_MS > deadline) throw new UploadPending(progressId);
+      await new Promise((resolve) => setTimeout(resolve, PROGRESS_POLL_MS));
+    }
+  }
+
+  /** Posts an upload ticket's params (and the file, if any) to the storage host it names. */
+  private async postToStorage(
+    ticket: { upload_url: string; upload_params?: Record<string, string>; file_param?: string },
+    timeoutMs: number,
+    file?: UploadFile,
+  ): Promise<{ res: Response; uploadUrl: URL }> {
+    const uploadUrl = new URL(ticket.upload_url);
+    this.assertTransferUrl(uploadUrl);
+    const form = new FormData();
+    for (const [key, value] of Object.entries(ticket.upload_params ?? {})) form.append(key, value);
+    if (file) form.append(ticket.file_param ?? "file", file.data, file.name);
+    const res = await this.send(uploadUrl, {
+      method: "POST",
+      body: form,
+      redirect: "manual",
+      headers: uploadUrl.origin === this.origin ? { Authorization: `Bearer ${this.token}` } : {},
+      signal: AbortSignal.timeout(timeoutMs),
+    });
+    return { res, uploadUrl };
   }
 
   /**

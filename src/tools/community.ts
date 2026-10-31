@@ -1,12 +1,12 @@
 // Calendar, inbox, recent activity, course people and groups (all read-only).
 import { z } from "zod";
 import { compact, htmlToMarkdown, truncate } from "../format.js";
-import { DAY_MS, READ_ONLY, activeCourseIds, courseId, resolveRange, run, type Obj, type ToolContext } from "./shared.js";
+import { DAY_MS, READ_ONLY, activeCourseIds, courseId, resolveRange, type Obj, type ToolContext } from "./shared.js";
 
 // Canvas rejects calendar_events requests with more than 10 context codes.
 const CONTEXTS_PER_REQUEST = 10;
 
-export function registerCommunityTools({ server, canvas }: ToolContext): void {
+export function registerCommunityTools({ server, canvas, run }: ToolContext): void {
   server.registerTool(
     "list_calendar_events",
     {
@@ -206,26 +206,31 @@ export function registerCommunityTools({ server, canvas }: ToolContext): void {
     {
       title: "List my groups",
       description:
-        "List the user's Canvas groups (e.g. project teams) in current courses, with their members and user IDs.",
+        "List the user's Canvas groups (e.g. project teams) in current courses, or in one course, with their members and user IDs.",
       inputSchema: {
+        course_id: courseId.optional().describe("Only groups in this course"),
         include_past: z.boolean().optional().describe("Also include groups from past courses"),
       },
       annotations: READ_ONLY,
     },
-    async ({ include_past }) =>
+    async ({ course_id, include_past }) =>
       run(async () => {
         const c = canvas();
         const [groups, active] = await Promise.all([
           c.getAll<Obj>("users/self/groups"),
-          include_past ? undefined : activeCourseIds(c),
+          include_past || course_id ? undefined : activeCourseIds(c),
         ]);
-        const current = active ? groups.filter((g) => active.includes(String(g.course_id))) : groups;
+        const current = course_id
+          ? groups.filter((g) => String(g.course_id) === course_id)
+          : active
+            ? groups.filter((g) => active.includes(String(g.course_id)))
+            : groups;
         return Promise.all(
           current.map(async (g) => {
             const members = await c.getAll<Obj>(`groups/${g.id}/users`, {}, 100).catch(() => undefined);
             return compact({
               id: g.id,
-              name: g.name,
+              name: g.name?.trim(),
               course_id: g.course_id,
               category: g.group_category?.name,
               member_count: g.members_count,

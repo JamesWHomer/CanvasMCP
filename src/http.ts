@@ -1,7 +1,11 @@
 // Remote entry point: MCP over Streamable HTTP (stateless, JSON responses) for serverless hosting.
 import { createHash, timingSafeEqual } from "node:crypto";
 import { WebStandardStreamableHTTPServerTransport } from "@modelcontextprotocol/sdk/server/webStandardStreamableHttp.js";
+import type { CanvasClient } from "./canvas.js";
 import { clientFromEnv, createCanvasServer } from "./server.js";
+
+// Kept across requests while the instance lives, so per-client lookups (the user's time zone) are cached.
+let client: CanvasClient | undefined;
 
 const json = (status: number, message: string) =>
   Response.json({ jsonrpc: "2.0", error: { code: -32001, message }, id: null }, { status });
@@ -27,7 +31,8 @@ export async function handleMcpRequest(req: Request): Promise<Response> {
   if (!expected) return json(500, "Server misconfigured: MCP_ACCESS_KEY is not set.");
   if (!keyMatches(presentedKey(req), expected)) return json(401, "Unauthorized: missing or wrong access key.");
 
-  const server = createCanvasServer(clientFromEnv(), { allowLocalFiles: false });
+  client ??= clientFromEnv();
+  const server = createCanvasServer(client, { allowLocalFiles: false });
   const transport = new WebStandardStreamableHTTPServerTransport({
     sessionIdGenerator: undefined,
     enableJsonResponse: true,

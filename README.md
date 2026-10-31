@@ -113,8 +113,9 @@ vercel deploy --prod
 | `get_profile` | Your name, ID and time zone (useful as a connection check) |
 | `list_courses` | Active courses with IDs, term and current grade (`include_completed` for past ones) |
 | `get_planner` | Everything due across all courses in a date range, with submission status |
-| `list_assignments` | A course's assignments, filterable by `bucket` (upcoming, overdue, unsubmitted…) |
-| `get_assignment` | Full instructions as Markdown, rubric, your score, rubric marks and instructor comments |
+| `list_assignments` | A course's assignments, filterable by `bucket` (upcoming, overdue, unsubmitted…), with group assignments flagged |
+| `get_assignment` | Full instructions as Markdown, rubric, your group (for group assignments), your submitted files, score, rubric marks and instructor comments |
+| `get_submission` | Just your submission: status, score, files with upload status, attempts used and their history, grader comments, and for group assignments your group and who uploaded the files |
 | `get_grades` | Overall grade plus every score, grouped by weighted assignment group |
 | `list_announcements` | Recent announcements across courses |
 | `list_modules` | Modules and their items (pages, files, assignments…) with completion |
@@ -133,10 +134,10 @@ vercel deploy --prod
 | `calculate_grade` | Current grade, the possible final range, what-if scores, and the average needed on remaining work for a target. Accepts the weight of assessments not in Canvas, such as an exam |
 | `list_quizzes` / `get_quiz` | Classic and New Quizzes with time limits, attempts and scores |
 | `list_course_people` | Teaching staff (or classmates by name) with user IDs and emails |
-| `list_my_groups` | Your groups in current courses, with members |
+| `list_my_groups` | Your groups in current courses (or one course, with `course_id`), with members |
 | `canvas_api_get` | Raw read-only GET for any other [Canvas API](https://canvas.instructure.com/doc/api/) endpoint |
 
-Dates given as a bare day (e.g. `2026-11-03`) mean that whole day in your Canvas time zone. Timestamps come back in UTC; the model converts them using the time zone from `get_profile`.
+Dates given as a bare day (e.g. `2026-11-03`) mean that whole day in your Canvas time zone. Timestamps come back in that time zone too, with its UTC offset (e.g. `2026-11-07T23:59:00+11:00`).
 
 The token is only ever sent to `CANVAS_BASE_URL`. File downloads and uploads go through Canvas's separate storage host without the token, and the raw tool is limited to `/api/v1/` paths.
 
@@ -152,10 +153,12 @@ These are off unless `CANVAS_ALLOW_WRITES=true`. They're on in the local `.env` 
 
 | Tool | What it does |
 | --- | --- |
-| `submit_assignment` | Submit text, a URL, or files. Files can be given as text, base64 or, on the local server only, a path on disk |
+| `submit_assignment` | Submit text, a URL, or files. Each file comes from a public download link, a file already in your Canvas files (`file_id`), text or base64 contents, or, on the local server only, a path on disk |
 | `post_discussion_reply` | Reply to a discussion topic or a specific entry |
 | `send_message` | Send a Canvas Inbox message to people (IDs from `list_course_people`), or reply in a conversation |
 | `set_planner_item_done` | Tick off (or un-tick) an item in your Canvas to-do list |
 | `create_planner_note` | Add a personal to-do to your Canvas planner |
 
-`submit_assignment`, `post_discussion_reply` and `send_message` are two-step. A call without `confirm: true` only returns a preview, which also flags late submissions, attempts left and disallowed file types. The action happens only on a second call with `confirm: true`, after you've approved the preview. Quizzes can't be taken through this server.
+`submit_assignment`, `post_discussion_reply` and `send_message` are two-step. A call without `confirm: true` only returns a preview, which also flags late submissions, attempts left and disallowed file types. For a group assignment it also names your group and any teammate's submission it would replace. The action happens only on a second call with `confirm: true`, after you've approved the preview. Quizzes can't be taken through this server.
+
+**Large files.** The Vercel server accepts about 3 MB per request, so inline contents only suit small files. For anything bigger, give `submit_assignment` a public download link (`files: [{ url }]`). Canvas downloads the file itself, so it never passes through this server. Google Drive and Dropbox share links are converted to direct downloads automatically, as long as the file is shared with "Anyone with the link". The preview checks the link first and refuses one that opens a web page (such as a sign-in page) instead of the file. If Canvas is still downloading after about 2½ minutes, nothing is submitted and the result says how to finish. The local server can also upload files of any size from disk (`path`).

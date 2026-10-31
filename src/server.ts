@@ -25,18 +25,20 @@ export function createCanvasServer(
     {
       instructions:
         "Access to the user's Canvas LMS account. Start with list_courses to get course IDs. " +
-        "For \"what's due\" or \"what am I missing\" questions use get_planner; for \"what's new\" use get_recent_activity. " +
+        "For \"what's due\" or \"what am I missing\" questions use get_planner; for \"what's new\" use get_recent_activity; " +
+        "to check whether something has been submitted use get_submission. " +
         "Use read_file to read PDFs, slides and other course files. " +
         "For what was said in a recorded lecture use list_lecture_recordings, then get_lecture_transcript. " +
         (allowLocalFiles
           ? "Use download_files to save original files (e.g. a template to fill in) to the user's computer, " +
             "and download_lecture_transcripts to save lecture subtitles. "
           : "") +
-        "Timestamps are UTC; get_profile returns the user's time zone for converting them." +
+        "Timestamps are already in the user's time zone, with its UTC offset (e.g. 2026-11-07T23:59:00+11:00)." +
         (allowWrites
           ? " Write tools are enabled. submit_assignment, post_discussion_reply and send_message act on the user's behalf " +
             "and are visible to others: always call them first without confirm, show the user the preview, and only call " +
-            "again with confirm: true after the user explicitly approves."
+            "again with confirm: true after the user explicitly approves. To submit a large file, give submit_assignment a " +
+            "public download link (files[].url) or a file_id rather than base64 contents."
           : ""),
     },
   );

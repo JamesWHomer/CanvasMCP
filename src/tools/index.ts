@@ -5,6 +5,7 @@ import { registerCommunityTools } from "./community.js";
 import { registerCoreTools } from "./core.js";
 import { registerFileTools } from "./files.js";
 import { registerLectureTools } from "./lectures.js";
+import { makeRunner } from "./shared.js";
 import { registerWriteTools } from "./write.js";
 
 export interface ToolOptions {
@@ -15,7 +16,7 @@ export interface ToolOptions {
 }
 
 export function registerTools(server: McpServer, canvas: () => CanvasClient, options: ToolOptions): void {
-  const ctx = { server, canvas, allowLocalFiles: options.allowLocalFiles };
+  const ctx = { server, canvas, allowLocalFiles: options.allowLocalFiles, run: makeRunner(canvas) };
   registerCoreTools(ctx);
   registerFileTools(ctx);
   registerCommunityTools(ctx);

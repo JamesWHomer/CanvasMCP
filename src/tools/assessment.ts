@@ -2,11 +2,11 @@
 import { z } from "zod";
 import { compact, htmlToMarkdown } from "../format.js";
 import { courseTotal, groupTotal, projectedFinal, requiredAverage, type GradeGroup } from "../grading.js";
-import { READ_ONLY, courseId, run, submissionSummary, type Obj, type ToolContext } from "./shared.js";
+import { READ_ONLY, courseId, submissionSummary, type Obj, type ToolContext } from "./shared.js";
 
 const round = (n: number | null | undefined) => (n === null || n === undefined ? undefined : Math.round(n * 100) / 100);
 
-export function registerAssessmentTools({ server, canvas }: ToolContext): void {
+export function registerAssessmentTools({ server, canvas, run }: ToolContext): void {
   server.registerTool(
     "calculate_grade",
     {

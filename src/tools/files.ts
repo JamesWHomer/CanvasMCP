@@ -11,7 +11,7 @@ import { z } from "zod";
 import { CanvasError, tooLarge } from "../canvas.js";
 import { extractFile } from "../extract.js";
 import { compact } from "../format.js";
-import { READ_ONLY, RawResult, run, type Obj, type ToolContext } from "./shared.js";
+import { READ_ONLY, RawResult, type Obj, type ToolContext } from "./shared.js";
 
 const MAX_DOWNLOAD_BYTES = 40_000_000;
 const DEFAULT_CHARS = 40_000;
@@ -82,7 +82,7 @@ export async function mapLimit<T, R>(items: T[], limit: number, fn: (item: T) =>
   return out;
 }
 
-export function registerFileTools({ server, canvas, allowLocalFiles }: ToolContext): void {
+export function registerFileTools({ server, canvas, allowLocalFiles, run }: ToolContext): void {
   server.registerTool(
     "read_file",
     {

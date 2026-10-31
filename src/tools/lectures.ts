@@ -6,20 +6,20 @@ import { z } from "zod";
 import { echo360, formatTranscript, timestamp, type Recording } from "../echo360.js";
 import { compact } from "../format.js";
 import { defaultDownloadDir, freePath, mapLimit, safeFileName } from "./files.js";
-import { READ_ONLY, courseId, run, type Obj, type ToolContext } from "./shared.js";
+import { READ_ONLY, courseId, type Obj, type ToolContext } from "./shared.js";
 
 const DEFAULT_CHARS = 40_000;
 const PARALLEL_DOWNLOADS = 4;
 const EXTENSIONS = { text: "txt", vtt: "vtt", srt: "srt" } as const;
 const AUTOMATED_NOTE = "Automatic speech-recognition transcript: names and technical terms may be misheard.";
 
-export function registerLectureTools({ server, canvas, allowLocalFiles }: ToolContext): void {
+export function registerLectureTools({ server, canvas, allowLocalFiles, run }: ToolContext): void {
   server.registerTool(
     "list_lecture_recordings",
     {
       title: "List lecture recordings",
       description:
-        "List a course's recorded lectures and other videos from its Echo360 tool (usually the \"Recorded Lectures\" tab), with the recording_id get_lecture_transcript needs. group is the folder or module a video sits in; date is when it was recorded or uploaded (UTC).",
+        "List a course's recorded lectures and other videos from its Echo360 tool (usually the \"Recorded Lectures\" tab), with the recording_id get_lecture_transcript needs. group is the folder or module a video sits in; date is when it was recorded or uploaded.",
       inputSchema: { course_id: courseId },
       annotations: READ_ONLY,
     },

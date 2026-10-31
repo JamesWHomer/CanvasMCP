@@ -1,26 +1,29 @@
 // The original read-only tools: profile, courses, planner, assignments, content, files, grades, discussions.
 import { z } from "zod";
 import type { Params } from "../canvas.js";
-import { compact, htmlToMarkdown, truncate } from "../format.js";
+import { compact, htmlToMarkdown, richTextToMarkdown, truncate } from "../format.js";
 import {
   DAY_MS,
   READ_ONLY,
   activeCourseIds,
+  assignmentGroup,
+  attachmentList,
   courseId,
+  groupInfo,
   resolveRange,
-  run,
   submissionSummary,
+  uploadedBy,
   type Obj,
   type ToolContext,
 } from "./shared.js";
 
-export function registerCoreTools({ server, canvas }: ToolContext): void {
+export function registerCoreTools({ server, canvas, run }: ToolContext): void {
   server.registerTool(
     "get_profile",
     {
       title: "Get my Canvas profile",
       description:
-        "Get the signed-in Canvas user's name, ID, email and time zone. Use it to check the connection works, and to convert the UTC timestamps other tools return into the user's local time.",
+        "Get the signed-in Canvas user's name, ID, email and time zone. Use it to check the connection works. Other tools already give timestamps in this time zone, with its UTC offset.",
       annotations: READ_ONLY,
     },
     async () =>
@@ -84,7 +87,7 @@ export function registerCoreTools({ server, canvas }: ToolContext): void {
     {
       title: "Planner: what's due",
       description:
-        "List to-do items across all courses (assignments, quizzes, discussions, announcements, calendar events, personal planner notes) in a date range, with submission status. Best tool for questions like \"what's due this week?\" or \"what am I missing?\". Defaults to today (in the user's time zone) through the next 14 days; set start_date in the past to find missing work. Times are UTC. Each item's type and id can be passed to set_planner_item_done when writes are enabled.",
+        "List to-do items across all courses (assignments, quizzes, discussions, announcements, calendar events, personal planner notes) in a date range, with submission status. Best tool for questions like \"what's due this week?\" or \"what am I missing?\". Defaults to today (in the user's time zone) through the next 14 days; set start_date in the past to find missing work. Each item's type and id can be passed to set_planner_item_done when writes are enabled.",
       inputSchema: {
         start_date: z
           .string()
@@ -170,6 +173,7 @@ export function registerCoreTools({ server, canvas }: ToolContext): void {
             lock_at: a.lock_at,
             points_possible: a.points_possible,
             submission_types: a.submission_types,
+            group_assignment: a.group_category_id ? true : undefined,
             url: a.html_url,
             submission: submissionSummary(a.submission),
           }),
@@ -182,7 +186,7 @@ export function registerCoreTools({ server, canvas }: ToolContext): void {
     {
       title: "Get assignment details",
       description:
-        "Get one assignment's full instructions (as Markdown), rubric, allowed submission types, and the user's submission including score, rubric marks and instructor comments.",
+        "Get one assignment's full instructions (as Markdown), rubric, allowed submission types, group details for group assignments, and the user's submission including files, score, rubric marks and instructor comments. To just check submission status, get_submission is much shorter.",
       inputSchema: {
         course_id: courseId,
         assignment_id: z.coerce.string().describe("Assignment ID"),
@@ -201,6 +205,7 @@ export function registerCoreTools({ server, canvas }: ToolContext): void {
             .catch(() => undefined),
         ]);
         const marks: Obj = sub?.rubric_assessment ?? {};
+        const group = await assignmentGroup(c, a);
         return compact({
           id: a.id,
           name: a.name,
@@ -215,15 +220,17 @@ export function registerCoreTools({ server, canvas }: ToolContext): void {
           allowed_attempts: a.allowed_attempts === -1 ? "unlimited" : a.allowed_attempts,
           quiz_id: a.quiz_id,
           discussion_topic_id: a.discussion_topic?.id,
+          group: groupInfo(a, group),
           description: htmlToMarkdown(a.description),
           rubric: a.rubric?.map((r: Obj) =>
             compact({
-              criterion: r.description,
-              details: r.long_description,
+              criterion: richTextToMarkdown(r.description),
+              details: richTextToMarkdown(r.long_description),
               points: r.points,
-              ratings: r.ratings?.map(
-                (x: Obj) => `${x.points} pts: ${x.description}${x.long_description ? ` (${x.long_description})` : ""}`,
-              ),
+              ratings: r.ratings?.map((x: Obj) => {
+                const more = richTextToMarkdown(x.long_description);
+                return `${x.points} pts: ${richTextToMarkdown(x.description) ?? ""}${more ? ` (${more})` : ""}`;
+              }),
               your_points: marks[r.id]?.points,
               grader_comment: marks[r.id]?.comments,
             }),
@@ -231,11 +238,71 @@ export function registerCoreTools({ server, canvas }: ToolContext): void {
           submission: sub
             ? compact({
                 ...submissionSummary(sub),
+                files: attachmentList(sub),
                 comments: sub.submission_comments?.map((cm: Obj) =>
                   compact({ author: cm.author_name, at: cm.created_at, comment: cm.comment }),
                 ),
               })
             : undefined,
+        });
+      }),
+  );
+
+  server.registerTool(
+    "get_submission",
+    {
+      title: "Check my submission",
+      description:
+        "Check the user's submission for one assignment without its instructions: status, score, submitted files (name, size, upload status), attempts used and allowed, attempt history, and grader comments. For group assignments it also gives the group and who uploaded the files. Use it for \"have I submitted?\"; get_assignment has the full brief and rubric.",
+      inputSchema: {
+        course_id: courseId,
+        assignment_id: z.coerce.string().describe("Assignment ID"),
+      },
+      annotations: READ_ONLY,
+    },
+    async ({ course_id, assignment_id }) =>
+      run(async () => {
+        const c = canvas();
+        const base = `courses/${course_id}/assignments/${assignment_id}`;
+        const [a, sub] = await Promise.all([
+          c.get<Obj>(base),
+          c.get<Obj>(`${base}/submissions/self`, { include: ["submission_history", "submission_comments"] }),
+        ]);
+        const [group, by] = await Promise.all([
+          assignmentGroup(c, a),
+          a.group_category_id && sub.submitted_at ? uploadedBy(c, sub) : undefined,
+        ]);
+        const history: Obj[] = (sub.submission_history ?? [])
+          .filter((h: Obj) => h.submitted_at)
+          .sort((x: Obj, y: Obj) => Number(x.attempt) - Number(y.attempt));
+        return compact({
+          assignment: a.name,
+          due_at: a.due_at,
+          lock_at: a.lock_at,
+          ...submissionSummary(sub),
+          submission_type: sub.submission_type,
+          attempts_allowed: a.allowed_attempts > 0 ? a.allowed_attempts : "unlimited",
+          group: groupInfo(a, group),
+          uploaded_by: by,
+          files: attachmentList(sub),
+          submitted_url: sub.submission_type === "online_url" ? sub.url : undefined,
+          text: truncate(htmlToMarkdown(sub.body), 1000),
+          history:
+            history.length > 1
+              ? history.map((h) =>
+                  compact({
+                    attempt: h.attempt,
+                    submitted_at: h.submitted_at,
+                    late: h.late || undefined,
+                    score: h.score,
+                    files: h.attachments?.map((f: Obj) => f.display_name),
+                  }),
+                )
+              : undefined,
+          comments: sub.submission_comments?.map((cm: Obj) =>
+            compact({ author: cm.author_name, at: cm.created_at, comment: cm.comment }),
+          ),
+          url: a.html_url,
         });
       }),
   );
