@@ -1,5 +1,5 @@
-// End-to-end check: runs the built server (stdio and HTTP) against a mock Canvas API, a mock file-storage host
-// and a mock Echo360 (lecture recordings).
+// End-to-end check: runs the built server (stdio and HTTP) against a mock Canvas API, a mock file-storage host,
+// a mock Echo360 (lecture recordings) and a mock Ed (discussion and lessons).
 import assert from "node:assert/strict";
 import { mkdtemp, readFile, readdir, rm, writeFile } from "node:fs/promises";
 import { createServer } from "node:http";
@@ -12,12 +12,13 @@ import { Client } from "@modelcontextprotocol/sdk/client/index.js";
 import { StdioClientTransport, getDefaultEnvironment } from "@modelcontextprotocol/sdk/client/stdio.js";
 import { StreamableHTTPClientTransport } from "@modelcontextprotocol/sdk/client/streamableHttp.js";
 import { handleMcpRequest } from "../dist/http.js";
+import { markdownToEd } from "../dist/edxml.js";
 import { directDownloadUrl } from "../dist/links.js";
 
 const TOKEN = "test-token";
-const READ_TOOLS = 29;
+const READ_TOOLS = 34;
 const LOCAL_TOOLS = 2; // download_files and download_lecture_transcripts, stdio server only
-const WRITE_TOOLS = 5;
+const WRITE_TOOLS = 7;
 const downloadDir = await mkdtemp(join(tmpdir(), "canvas-mcp-downloads-"));
 
 // ---------- fixtures ----------
@@ -160,6 +161,201 @@ const echo = createServer(async (req, res) => {
   json(404, { status: "error", message: "Not found" });
 });
 
+// ---------- mock Ed (reached by following the course's Ed Discussion LTI launch) ----------
+
+const edLog = [];
+let edLogins = 0;
+let edToken;
+let edRejectNext = false;
+const edJwt = (payload) =>
+  [{ alg: "HS256" }, payload].map((p) => Buffer.from(JSON.stringify(p)).toString("base64url")).join(".") + ".sig";
+const edDoc = (inner) => `<document version="2.0">${inner}</document>`;
+const edCourse = (id, code, status, lastActive, discussion) => ({
+  course: { id, code, name: `${code} course`, year: "2026", session: "Semester 2", status, settings: { discussion } },
+  role: { role: "student" },
+  last_active: lastActive,
+});
+const edUser = {
+  user: { id: 1, name: "Test Student" },
+  courses: [
+    edCourse(501, "CHEM1001", "active", "2026-10-01T10:00:00+10:00", { readonly: true, categories: [{ name: "General" }] }),
+    edCourse(400, "OLD1000", "archived", "2025-06-01T10:00:00+10:00", { categories: [] }),
+    edCourse(500, "BIO1001", "active", "2026-10-30T10:00:00.123456+11:00", {
+      anonymous: true,
+      categories: [
+        { name: "General", subcategories: [] },
+        { name: "Labs", subcategories: [{ name: "Lab 1" }, { name: "Lab 2" }] },
+      ],
+    }),
+  ],
+};
+const edUsers = [
+  { id: 1, name: "Test Student", course_role: "student" },
+  { id: 2, name: "Dr Tutor", course_role: "admin" },
+  { id: 3, name: "Sam Mentor", course_role: "mentor" },
+];
+const edListThread = (id, number, created, extra = {}) => ({
+  id,
+  number,
+  course_id: 500,
+  type: "question",
+  title: `Thread ${number}`,
+  category: "Labs",
+  subcategory: "Lab 1",
+  document: "word ".repeat(60),
+  created_at: created,
+  reply_count: 1,
+  vote_count: 0,
+  is_seen: true,
+  user: edUsers[1],
+  ...extra,
+});
+const edThreads500 = [
+  edListThread(700, 12, "2026-10-30T09:00:00.123456+11:00", { is_seen: false, is_staff_answered: true, is_answered: true }),
+  edListThread(710, 11, "2026-10-20T09:00:00+11:00", { user: null, is_anonymous: true, type: "post", new_reply_count: 2 }),
+];
+const edThreads501 = [
+  { ...edListThread(720, 3, "2026-10-25T09:00:00+11:00", { type: "announcement" }), course_id: 501, user: edUsers[1] },
+];
+const edReply = (id, userId, type, text, extra = {}) => ({
+  id,
+  user_id: userId,
+  type,
+  content: edDoc(`<paragraph>${text}</paragraph>`),
+  document: text,
+  created_at: "2026-10-30T10:00:00+11:00",
+  comments: [],
+  ...extra,
+});
+const edThreadDetail = {
+  thread: {
+    id: 700,
+    number: 12,
+    course_id: 500,
+    user_id: 1,
+    type: "question",
+    title: "Is the lab report due Friday?",
+    category: "Labs",
+    subcategory: "Lab 1",
+    accepted_id: 803,
+    is_answered: true,
+    is_staff_answered: true,
+    unique_view_count: 40,
+    created_at: "2026-10-30T09:00:00.123456+11:00",
+    content: edDoc(
+      '<paragraph>Is the <bold>lab report</bold> due <italic>Friday</italic>? See <link href="https://example.com/a?b=1&amp;c=2">the spec</link>.</paragraph>' +
+        '<list style="number"><list-item><paragraph>Intro</paragraph></list-item><list-item><paragraph>Method</paragraph></list-item></list>' +
+        '<snippet language="py" runnable="true" line-numbers="true"><snippet-file id="code">print(&quot;hi&quot;)\nx = 1 &lt; 2</snippet-file></snippet>' +
+        '<figure><image src="https://static.example/img.png" width="10" height="10"/></figure>' +
+        '<file url="https://static.example/spec.pdf" filename="spec.pdf"/><heading level="2"/>' +
+        "<paragraph>Ratio <math>x_1/2</math></paragraph>" +
+        "<table><table-row><table-cell><paragraph>Week</paragraph></table-cell><table-cell><paragraph>Room</paragraph></table-cell></table-row>" +
+        "<table-row><table-cell><paragraph>1</paragraph></table-cell><table-cell><paragraph>A|B</paragraph></table-cell></table-row></table>" +
+        "<paragraph>End</paragraph>",
+    ),
+    answers: [
+      edReply(801, 2, "answer", "Yes, Friday.", {
+        is_endorsed: true,
+        vote_count: 2,
+        created_at: "2026-10-30T09:30:00.5+11:00",
+        comments: [edReply(802, 0, "comment", "Thanks", { is_anonymous: true, anonymous_id: 99 })],
+      }),
+      edReply(803, 3, "answer", "Friday at 5pm."),
+    ],
+    comments: [edReply(804, 3, "comment", "Ask your tutor too.", { is_private: true })],
+  },
+  users: edUsers,
+};
+const edLessons = {
+  modules: [{ id: 1, name: "Week 1" }],
+  lessons: [
+    { id: 902, module_id: null, title: "Week 10 notes", slide_count: 1, status: "unattempted", state: "active" },
+    { id: 900, module_id: 1, title: "Lab prep", slide_count: 4, status: "attempted", state: "active", effective_due_at: "2026-11-05T23:59:00+11:00" },
+    { id: 901, module_id: null, title: "Week 2 notes", slide_count: 1, status: "completed", state: "scheduled" },
+  ],
+};
+const edLesson = {
+  lesson: {
+    id: 900,
+    course_id: 500,
+    title: "Lab prep",
+    status: "attempted",
+    slides: [
+      {
+        id: 9001,
+        type: "document",
+        title: "Truth table",
+        status: "completed",
+        content: edDoc(
+          '<paragraph>XOR:</paragraph><web-snippet layout="seamless"><web-snippet-file language="html">&lt;table&gt;&lt;tr&gt;&lt;th&gt;Bit A&lt;/th&gt;&lt;th&gt;Bit B&lt;/th&gt;&lt;/tr&gt;&lt;tr&gt;&lt;td&gt;0&lt;/td&gt;&lt;td&gt;1&lt;/td&gt;&lt;/tr&gt;&lt;/table&gt;</web-snippet-file><web-snippet-file language="css">table { color: red }</web-snippet-file></web-snippet>',
+        ),
+      },
+      { id: 9002, type: "quiz", title: "Check", status: "seen" },
+      { id: 9003, type: "code", title: "Decoder", status: "unseen", content: edDoc("<paragraph>Decode the cipher.</paragraph>") },
+      { id: 9004, type: "document", title: "Staff only", is_hidden: true, content: edDoc("<paragraph>secret</paragraph>") },
+    ],
+  },
+};
+const edQuestions = {
+  questions: [
+    { index: 1, data: { type: "true-false", content: edDoc("<paragraph>XOR is its own inverse.</paragraph>") } },
+    {
+      index: 0,
+      data: {
+        type: "multiple-choice",
+        content: edDoc("<paragraph>Which is <bold>not</bold> required?</paragraph>"),
+        answers: [edDoc("<paragraph>Yes</paragraph>"), edDoc("<paragraph>No</paragraph>")],
+      },
+    },
+  ],
+};
+
+const edServer = createServer(async (req, res) => {
+  const url = new URL(req.url, `http://${req.headers.host}`);
+  const raw = await readBody(req);
+  const body = raw && req.headers["content-type"]?.includes("json") ? JSON.parse(raw) : raw;
+  edLog.push({ method: req.method, path: url.pathname, query: url.searchParams, auth: req.headers.authorization, token: req.headers["x-token"], body });
+  const json = (status, data) => {
+    res.writeHead(status, { "content-type": "application/json" });
+    res.end(JSON.stringify(data));
+  };
+  if (req.method === "POST" && url.pathname === "/api/lti/launch") {
+    res.writeHead(302, { location: "/au/courses/500?_logintoken=lt-1" });
+    return res.end();
+  }
+  if (url.pathname === "/au/courses/500") {
+    res.writeHead(200, { "content-type": "text/html" });
+    return res.end("<html>Ed</html>");
+  }
+  if (req.method === "POST" && url.pathname === "/api/login_token") {
+    if (body?.login_token !== "lt-1") return json(400, { code: "token_invalid" });
+    edToken = edJwt({ type: "token", login: ++edLogins, exp: Math.floor(Date.now() / 1000) + 14 * 86_400 });
+    return json(200, { token: edToken });
+  }
+  if (!edToken || req.headers["x-token"] !== edToken || edRejectNext) {
+    edRejectNext = false;
+    return json(401, { code: "bad_token", message: "Invalid token" });
+  }
+  const routes = {
+    "GET /api/user": () => json(200, edUser),
+    "GET /api/courses/500/threads": () => json(200, { sort_key: "", threads: edThreads500, users: [] }),
+    "GET /api/courses/501/threads": () => json(200, { sort_key: "", threads: edThreads501, users: [] }),
+    "GET /api/courses/500/threads/search": () => json(200, { threads: [edThreads500[1]], total: 7, users: [] }),
+    "GET /api/threads/700": () => json(200, edThreadDetail),
+    "GET /api/courses/500/threads/12": () => json(200, edThreadDetail),
+    "GET /api/courses/500/lessons": () => json(200, edLessons),
+    "GET /api/lessons/900": () => json(200, edLesson),
+    "GET /api/lessons/slides/9002/questions": () => json(200, edQuestions),
+    "POST /api/courses/500/threads": () =>
+      json(200, { thread: { ...body.thread, id: 701, number: 13, course_id: 500, approved_status: "approved" } }),
+    "POST /api/threads/700/comments": () => json(200, { comment: { id: 850, ...body.comment } }),
+    "POST /api/comments/801/comments": () => json(200, { comment: { id: 851, ...body.comment } }),
+  };
+  const handler = routes[`${req.method} ${url.pathname}`];
+  if (handler) return handler();
+  json(404, { code: "not_found", message: "Not found" });
+});
+
 // ---------- mock Canvas ----------
 
 const canvasLog = [];
@@ -176,8 +372,17 @@ const canvas = createServer(async (req, res) => {
   };
   // The one-time launch link authenticates with its session_token, not the API token, like a browser would.
   if (url.pathname === "/courses/101/external_tools/sessionless_launch") {
-    if (url.searchParams.get("session_token") !== "launch-token" || req.headers.authorization) {
+    const launchToken = url.searchParams.get("session_token");
+    if (!["launch-token", "ed-launch-token"].includes(launchToken) || req.headers.authorization) {
       return send(401, { errors: [{ message: "bad launch" }] });
+    }
+    if (launchToken === "ed-launch-token") {
+      res.writeHead(200, { "content-type": "text/html" });
+      return res.end(
+        `<form action="${edOrigin}/api/lti/launch" method="POST">` +
+          `<input type="hidden" name="id_token" value="lti.jwt"><input type="hidden" name="state" value="s1">` +
+          `</form>`,
+      );
     }
     res.writeHead(200, { "content-type": "text/html", "set-cookie": "canvas_session=s1; path=/" });
     return res.end(
@@ -416,12 +621,16 @@ const canvas = createServer(async (req, res) => {
         { id: "home", label: "Home", type: "internal" },
         { id: "context_external_tool_7", label: "Zoom", type: "external" },
         { id: "context_external_tool_8", label: "Recorded Lectures", type: "external" },
+        { id: "context_external_tool_9", label: "Ed Discussion", type: "external" },
       ]),
     "GET /api/v1/courses/102/tabs": () => send(200, [{ id: "context_external_tool_7", label: "Zoom", type: "external" }]),
-    "GET /api/v1/courses/101/external_tools/sessionless_launch": () =>
-      url.searchParams.get("id") === "8"
-        ? send(200, { id: "8", name: "Echo360 Cloud", url: `${origin}/courses/101/external_tools/sessionless_launch?session_token=launch-token` })
-        : send(200, { id: "7", name: "Zoom", url: `${origin}/zoom` }),
+    "GET /api/v1/courses/101/external_tools/sessionless_launch": () => {
+      const launches = {
+        8: { id: "8", name: "Echo360 Cloud", url: `${origin}/courses/101/external_tools/sessionless_launch?session_token=launch-token` },
+        9: { id: "9", name: "Ed Discussion", url: `${origin}/courses/101/external_tools/sessionless_launch?session_token=ed-launch-token` },
+      };
+      send(200, launches[url.searchParams.get("id")] ?? { id: "7", name: "Zoom", url: `${origin}/zoom` });
+    },
     "GET /api/v1/courses/102/external_tools/sessionless_launch": () => send(200, { id: "7", name: "Zoom", url: `${origin}/zoom` }),
   };
   if (req.method === "GET" && url.pathname.match(/^\/files\/\d+\/download$/)) {
@@ -448,6 +657,7 @@ const listen = (server) =>
 const baseUrl = await listen(canvas);
 const storageOrigin = await listen(storage);
 const echoOrigin = await listen(echo);
+const edOrigin = await listen(edServer);
 
 // ---------- harness ----------
 
@@ -834,6 +1044,151 @@ await check("download_lecture_transcripts: saves subtitle files, reports failure
   assert.equal(echoLog.filter((r) => r.path === "/lti/launch").length, 1, "one LTI launch serves every call");
 });
 
+const edRequests = (path) => edLog.filter((r) => r.path === path);
+
+await check("ed_list_courses: signs in to Ed through Canvas's Ed tab; active courses, most recent first", async () => {
+  const { data } = await call(client, "ed_list_courses");
+  assert.deepEqual(data.map((c) => c.ed_course_id), ["500", "501"]);
+  assert.deepEqual(data[0], {
+    ed_course_id: "500",
+    code: "BIO1001",
+    name: "BIO1001 course",
+    session: "Semester 2 2026",
+    role: "student",
+    last_active: "2026-10-29T19:00:00-04:00",
+    categories: ["General", "Labs (Lab 1, Lab 2)"],
+    url: `${edOrigin}/au/courses/500/discussion`,
+  });
+  // The Ed tab is the only one launched for Ed, and the one-time login token is traded for an API token.
+  assert.ok(launchRequests().some((r) => r.query.get("id") === "9"));
+  assert.equal(new URLSearchParams(edRequests("/api/lti/launch")[0].body).get("id_token"), "lti.jwt");
+  assert.deepEqual(edRequests("/api/login_token")[0].body, { login_token: "lt-1" });
+  assert.equal(edLogins, 1);
+  assert.ok(edLog.every((r) => r.auth === undefined), "the Canvas token must never reach Ed");
+  const all = await call(client, "ed_list_courses", { include_archived: true });
+  assert.deepEqual(all.data.map((c) => c.ed_course_id), ["500", "501", "400"]);
+  assert.equal(all.data[2].status, "archived");
+});
+
+await check("ed_list_threads: one course, with Ed's filter names, authors and unread flags", async () => {
+  const { data } = await call(client, "ed_list_threads", { ed_course_id: "500", filter: "new_replies", limit: 2 });
+  const query = edRequests("/api/courses/500/threads").at(-1).query;
+  assert.equal(query.get("filter"), "new");
+  assert.equal(query.get("sort"), "new");
+  assert.equal(query.get("limit"), "2");
+  assert.equal(data.next_offset, 2);
+  const [first, second] = data.threads;
+  assert.equal(first.thread_id, 700);
+  assert.equal(first.author, "Dr Tutor (staff)");
+  assert.equal(first.category, "Labs › Lab 1");
+  assert.equal(first.created_at, "2026-10-29T18:00:00-04:00");
+  assert.equal(first.unread, true);
+  assert.equal(first.answered, "by staff");
+  assert.ok(first.preview.endsWith("…") && first.preview.length <= 201, first.preview);
+  assert.equal(first.url, `${edOrigin}/au/courses/500/discussion/700`);
+  assert.equal(second.author, "Anonymous");
+  assert.equal(second.new_replies, 2);
+  assert.equal(second.answered, undefined);
+});
+
+await check("ed_list_threads: a query goes to Ed's search, ranked by relevance", async () => {
+  const { data } = await call(client, "ed_list_threads", { ed_course_id: "500", query: " lab " });
+  const query = edRequests("/api/courses/500/threads/search").at(-1).query;
+  assert.equal(query.get("query"), "lab");
+  assert.equal(query.get("sort"), null);
+  assert.equal(data.total, 7);
+  assert.equal(data.threads[0].thread_id, 710);
+});
+
+await check("ed_list_threads: without a course, every active Ed course, newest first", async () => {
+  const { data } = await call(client, "ed_list_threads", { filter: "unread" });
+  assert.equal(data.courses, 2);
+  assert.deepEqual(data.threads.map((t) => t.thread_id), [700, 720, 710]);
+  assert.equal(data.threads[1].course, "CHEM1001");
+  assert.equal(edRequests("/api/courses/400/threads").length, 0, "archived courses are skipped");
+});
+
+await check("ed_get_thread: the post as Markdown, accepted answer first, nested replies", async () => {
+  const { data } = await call(client, "ed_get_thread", { thread_id: "700" });
+  assert.equal(data.title, "Is the lab report due Friday?");
+  assert.equal(data.author, "Test Student");
+  assert.equal(data.views, 40);
+  for (const part of [
+    "Is the **lab report** due _Friday_? See [the spec](https://example.com/a?b=1&c=2).",
+    "1.  Intro\n2.  Method",
+    '```py\nprint("hi")\nx = 1 < 2\n```',
+    "![image](https://static.example/img.png)",
+    "Attachment: [spec.pdf](https://static.example/spec.pdf)",
+    "Ratio `x_1/2`",
+    "| Week | Room |\n| --- | --- |\n| 1 | A\\|B |",
+  ]) {
+    assert.ok(data.body.includes(part), `missing ${JSON.stringify(part)} in:\n${data.body}`);
+  }
+  assert.doesNotMatch(data.body, /#.*Ratio/, "an empty <heading/> must not swallow what follows");
+  assert.equal(data.total_replies, 3);
+  const [accepted, endorsed, privateComment] = data.replies;
+  assert.deepEqual([accepted.comment_id, accepted.accepted, accepted.author], [803, true, "Sam Mentor (mentor)"]);
+  assert.equal(endorsed.endorsed, true);
+  assert.equal(endorsed.created_at, "2026-10-29T18:30:00-04:00");
+  assert.equal(endorsed.replies[0].author, "Anonymous");
+  assert.equal(endorsed.replies[0].body, "Thanks");
+  assert.deepEqual([privateComment.type, privateComment.private], ["comment", true]);
+});
+
+await check("ed_get_thread: by course and number, paged", async () => {
+  const { data } = await call(client, "ed_get_thread", { ed_course_id: "500", number: 12, offset: 1, limit: 1 });
+  assert.equal(edRequests("/api/courses/500/threads/12").length, 1);
+  assert.deepEqual(data.replies.map((r) => r.comment_id), [801]);
+  assert.equal(data.offset, 1);
+  assert.equal(data.next_offset, 2);
+});
+
+await check("ed tools refuse IDs that aren't numbers", async () => {
+  const result = await call(client, "ed_get_thread", { thread_id: "../user" });
+  assert.equal(result.isError, true);
+  assert.match(result.data, /thread_id must be a number/);
+});
+
+await check("ed_list_lessons: grouped by module, the rest in title order", async () => {
+  const { data } = await call(client, "ed_list_lessons", { ed_course_id: "500" });
+  assert.equal(data.count, 3);
+  assert.equal(data.modules[0].module, "Week 1");
+  assert.deepEqual(data.modules[0].lessons[0], {
+    lesson_id: 900,
+    title: "Lab prep",
+    slides: 4,
+    status: "attempted",
+    due_at: "2026-11-05T07:59:00-05:00",
+    url: `${edOrigin}/au/courses/500/lessons/900`,
+  });
+  assert.deepEqual(data.other_lessons.map((l) => l.title), ["Week 2 notes", "Week 10 notes"]);
+  assert.equal(data.other_lessons[0].state, "scheduled");
+});
+
+await check("ed_get_lesson: slides as Markdown, quiz questions with options, hidden slides left out", async () => {
+  const { data } = await call(client, "ed_get_lesson", { lesson_id: "900" });
+  assert.equal(data.slides, 3);
+  for (const part of [
+    "## 1. Truth table (document, completed)\n\nXOR:\n\n| Bit A | Bit B |\n| --- | --- |\n| 0 | 1 |",
+    "## 2. Check (quiz, seen)\n\n**Question 1** (multiple-choice)\n\nWhich is **not** required?\n\n- A. Yes\n- B. No\n\n**Question 2** (true-false)",
+    "## 3. Decoder (code, unseen)\n\nDecode the cipher.\n\n(Coding challenge: write and run the code in Ed.)",
+  ]) {
+    assert.ok(data.text.includes(part), `missing ${JSON.stringify(part)} in:\n${data.text}`);
+  }
+  assert.doesNotMatch(data.text, /color: red|secret|Staff only/);
+  assert.equal(data.next_offset, undefined);
+  const paged = await call(client, "ed_get_lesson", { lesson_id: "900", offset: 20, max_chars: 1000 });
+  assert.equal(paged.data.text, data.text.slice(20, 1020));
+});
+
+await check("Ed: a rejected token signs in again once, without the caller noticing", async () => {
+  assert.equal(edLogins, 1, "one sign-in serves every call");
+  edRejectNext = true;
+  const { data, isError } = await call(client, "ed_list_courses");
+  assert.ok(!isError, data);
+  assert.equal(edLogins, 2);
+});
+
 await client.close();
 
 const badToken = await connect({ CANVAS_BASE_URL: baseUrl, CANVAS_API_TOKEN: "wrong" });
@@ -1089,6 +1444,99 @@ await check("create_planner_note uses the user's time zone", async () => {
   assert.equal(posts("/api/v1/planner_notes").at(-1).body.todo_date, "2026-11-10T05:00:00.000Z");
 });
 
+const edPosts = (path) => edLog.filter((r) => r.method === "POST" && r.path === path);
+
+await check("ed_post_thread: preview checks the category and posts nothing", async () => {
+  const args = {
+    ed_course_id: "500",
+    title: "Lab Q",
+    body: "Is it **due** Friday?\n\n- a\n- b",
+    category: "labs",
+    subcategory: "lab 2",
+    anonymous: true,
+  };
+  const { data } = await call(writer, "ed_post_thread", args);
+  assert.match(data.status, /^PREVIEW/);
+  assert.equal(data.category, "Labs › Lab 2");
+  assert.equal(data.visible_to, "everyone in BIO1001");
+  assert.equal(data.shown_as, "Anonymous to other students; staff can still see the user's name");
+  assert.equal(edPosts("/api/courses/500/threads").length, 0);
+
+  const unknown = await call(writer, "ed_post_thread", { ...args, category: "Exams" });
+  assert.match(unknown.data, /no category "Exams"\. Categories: General; Labs \(Lab 1, Lab 2\)/);
+  const missing = await call(writer, "ed_post_thread", { ...args, category: undefined });
+  assert.match(missing.data, /Choose a category/);
+  const readOnly = await call(writer, "ed_post_thread", { ...args, ed_course_id: "501", category: "General" });
+  assert.match(readOnly.data, /read-only for students/);
+});
+
+await check("ed_post_thread: confirm posts the body as Ed XML", async () => {
+  const { data } = await call(writer, "ed_post_thread", {
+    ed_course_id: "500",
+    title: "Lab Q",
+    body: "Is it **due** Friday?\n\n- a\n- b",
+    category: "Labs",
+    subcategory: "Lab 2",
+    anonymous: true,
+    confirm: true,
+  });
+  assert.deepEqual(edPosts("/api/courses/500/threads")[0].body.thread, {
+    type: "question",
+    title: "Lab Q",
+    category: "Labs",
+    subcategory: "Lab 2",
+    subsubcategory: "",
+    content:
+      '<document version="2.0"><paragraph>Is it <bold>due</bold> Friday?</paragraph><list style="bullet"><list-item><paragraph>a</paragraph></list-item><list-item><paragraph>b</paragraph></list-item></list></document>',
+    is_pinned: false,
+    is_private: false,
+    is_anonymous: true,
+    is_megathread: false,
+    anonymous_comments: false,
+  });
+  assert.deepEqual(data, { status: "POSTED", thread_id: 701, number: 13, url: `${edOrigin}/au/courses/500/discussion/701` });
+});
+
+await check("ed_reply: preview names what it replies to; answers only go on questions", async () => {
+  const { data } = await call(writer, "ed_reply", { thread_id: "700", body: "Thanks!", reply_to_comment_id: "801" });
+  assert.match(data.status, /^PREVIEW/);
+  assert.equal(data.replying_to, 'Dr Tutor (staff)\'s answer: "Yes, Friday."');
+  assert.equal(data.posting_as, "a comment");
+  const nested = await call(writer, "ed_reply", { thread_id: "700", body: "x", as_answer: true, reply_to_comment_id: "801" });
+  assert.match(nested.data, /Only a question takes answers/);
+  const unknown = await call(writer, "ed_reply", { thread_id: "700", body: "x", reply_to_comment_id: "999" });
+  assert.match(unknown.data, /no answer or comment 999/);
+  assert.equal(edLog.filter((r) => r.method === "POST" && r.path.endsWith("/comments")).length, 0);
+});
+
+await check("ed_reply: confirm posts under a comment, or as an answer", async () => {
+  const reply = await call(writer, "ed_reply", { thread_id: "700", body: "Thanks!", reply_to_comment_id: "801", confirm: true });
+  assert.deepEqual(edPosts("/api/comments/801/comments")[0].body, {
+    comment: { type: "comment", content: '<document version="2.0"><paragraph>Thanks!</paragraph></document>', is_private: false, is_anonymous: false },
+  });
+  assert.equal(reply.data.comment_id, 851);
+  await call(writer, "ed_reply", { thread_id: "700", body: "Use `x_1`", as_answer: true, private: true, confirm: true });
+  assert.deepEqual(edPosts("/api/threads/700/comments")[0].body.comment, {
+    type: "answer",
+    content: '<document version="2.0"><paragraph>Use <code>x_1</code></paragraph></document>',
+    is_private: true,
+    is_anonymous: false,
+  });
+});
+
+await check("markdownToEd: blocks and inline formatting become Ed XML", async () => {
+  const md =
+    "# Plan\n\nSee [docs](https://x.com/?a=1&b=2) and `a**b`, snake_case_name, *em* and ~~gone~~.\nNext line\n\n" +
+    "1. one\n2. two\n\n> quoted <tag>\n\n```py\nif a < b:\n    pass\n```";
+  assert.equal(
+    markdownToEd(md),
+    '<document version="2.0"><heading level="1">Plan</heading>' +
+      '<paragraph>See <link href="https://x.com/?a=1&amp;b=2">docs</link> and <code>a**b</code>, snake_case_name, <italic>em</italic> and <strike>gone</strike>.<break/>Next line</paragraph>' +
+      '<list style="number"><list-item><paragraph>one</paragraph></list-item><list-item><paragraph>two</paragraph></list-item></list>' +
+      "<blockquote><paragraph>quoted &lt;tag&gt;</paragraph></blockquote><pre>if a &lt; b:\n    pass</pre></document>",
+  );
+});
+
 await writer.close();
 
 // ---------- HTTP entry point, served the way Vercel would: a Web Request in, a Web Response out ----------
@@ -1175,6 +1623,7 @@ httpServer.close();
 canvas.close();
 storage.close();
 echo.close();
+edServer.close();
 await rm(downloadDir, { recursive: true });
 console.log(failures ? `\n${failures} check(s) failed` : "\nAll checks passed");
 process.exit(failures ? 1 : 0);

@@ -3,6 +3,22 @@ import TurndownService from "turndown";
 
 const turndown = new TurndownService({ headingStyle: "atx", codeBlockStyle: "fenced", bulletListMarker: "-" });
 turndown.remove(["script", "style"]);
+// Tables become Markdown tables with the first row as the header; on its own turndown runs the cells together.
+// Each cell ends in " |" (pipes inside cells are escaped), so a row's cells can be counted.
+turndown.addRule("tableCell", {
+  filter: ["th", "td"],
+  replacement: (content) => ` ${content.replace(/\s*\n\s*/g, " ").replace(/\|/g, "\\|").trim()} |`,
+});
+turndown.addRule("tableRow", { filter: "tr", replacement: (content) => `\n|${content}\n` });
+turndown.addRule("table", {
+  filter: "table",
+  replacement: (content) => {
+    const rows = content.split("\n").filter((row) => row.startsWith("|"));
+    if (!rows.length) return "";
+    const columns = rows[0].match(/ \|/g)?.length ?? 1;
+    return `\n\n${[rows[0], `|${" --- |".repeat(columns)}`, ...rows.slice(1)].join("\n")}\n\n`;
+  },
+});
 
 /** Converts Canvas rich-content HTML to Markdown, keeping links. */
 export function htmlToMarkdown(html: string | null | undefined): string | undefined {
@@ -13,7 +29,7 @@ export function htmlToMarkdown(html: string | null | undefined): string | undefi
 
 const ENTITIES: Record<string, string> = { amp: "&", lt: "<", gt: ">", quot: '"', apos: "'", nbsp: " " };
 
-function decodeEntities(text: string): string {
+export function decodeEntities(text: string): string {
   return text.replace(/&(#x[0-9a-f]+|#\d+|[a-z]+);/gi, (match, entity: string) => {
     if (entity[0] !== "#") return ENTITIES[entity.toLowerCase()] ?? match;
     const code = entity[1].toLowerCase() === "x" ? parseInt(entity.slice(2), 16) : Number(entity.slice(1));

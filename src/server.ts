@@ -29,13 +29,15 @@ export function createCanvasServer(
         "to check whether something has been submitted use get_submission. " +
         "Use read_file to read PDFs, slides and other course files. " +
         "For what was said in a recorded lecture use list_lecture_recordings, then get_lecture_transcript. " +
+        "For Ed (edstem.org: the Ed Discussion forum and Ed Lessons) start with ed_list_courses; Ed course IDs differ from Canvas ones. " +
+        "Use ed_list_threads (filter \"unread\" for what's new) and ed_get_thread for discussions, ed_list_lessons and ed_get_lesson for lessons. " +
         (allowLocalFiles
           ? "Use download_files to save original files (e.g. a template to fill in) to the user's computer, " +
             "and download_lecture_transcripts to save lecture subtitles. "
           : "") +
         "Timestamps are already in the user's time zone, with its UTC offset (e.g. 2026-11-07T23:59:00+11:00)." +
         (allowWrites
-          ? " Write tools are enabled. submit_assignment, post_discussion_reply and send_message act on the user's behalf " +
+          ? " Write tools are enabled. submit_assignment, post_discussion_reply, send_message, ed_post_thread and ed_reply act on the user's behalf " +
             "and are visible to others: always call them first without confirm, show the user the preview, and only call " +
             "again with confirm: true after the user explicitly approves. To submit a large file, give submit_assignment a " +
             "public download link (files[].url) or a file_id rather than base64 contents."

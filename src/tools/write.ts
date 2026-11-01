@@ -18,13 +18,13 @@ import {
   type ToolContext,
 } from "./shared.js";
 
-const OUTWARD = { readOnlyHint: false, destructiveHint: true, openWorldHint: true } as const;
+export const OUTWARD = { readOnlyHint: false, destructiveHint: true, openWorldHint: true } as const;
 const PERSONAL = { readOnlyHint: false, destructiveHint: false, idempotentHint: true, openWorldHint: true } as const;
 const MAX_UPLOAD_BYTES = 2_000_000_000;
 // How long a confirmed submission waits for Canvas to download linked files; within Vercel's function time limit.
 const LINK_WAIT_MS = 150_000;
 
-const confirm = z
+export const confirm = z
   .boolean()
   .optional()
   .describe("Leave unset first to get a preview. Set true only after the user has approved that preview.");

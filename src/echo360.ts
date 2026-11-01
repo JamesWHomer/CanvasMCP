@@ -3,12 +3,10 @@
 // Echo360 session. Echo360's web-player endpoints, which are undocumented, then list the section's recordings and
 // return their transcripts. The Canvas API token itself is never sent to Echo360.
 import { CanvasError, type CanvasClient } from "./canvas.js";
+import { followLaunch, navigationTools, sessionlessLaunch, type Browser } from "./lti.js";
 
 type Obj = Record<string, any>;
 
-const REQUEST_TIMEOUT_MS = 30_000;
-const MAX_REDIRECTS = 15;
-const MAX_FORMS = 5;
 // A fresh launch is cheap, so a session is only reused briefly rather than risking an expired one.
 const SESSION_TTL_MS = 10 * 60_000;
 const SECTION_PATH = /\/section\/([0-9a-f-]{36})(?:\/|$)/i;
@@ -39,146 +37,21 @@ export interface Transcript {
 
 export type TranscriptFormat = "text" | "vtt" | "srt";
 
-const domainMatch = (host: string, domain: string) => host === domain || host.endsWith(`.${domain}`);
-
-/** Just enough of a browser's cookie handling to carry a session across Canvas, the LTI launch and Echo360. */
-class CookieJar {
-  private cookies: { name: string; value: string; domain: string; hostOnly: boolean }[] = [];
-
-  store(url: URL, res: Response): void {
-    for (const header of res.headers.getSetCookie()) {
-      const [pair, ...attrs] = header.split(";").map((s) => s.trim());
-      const eq = pair.indexOf("=");
-      if (eq < 1) continue;
-      const name = pair.slice(0, eq);
-      const attr = (key: string) => attrs.find((a) => a.toLowerCase().startsWith(`${key}=`))?.slice(key.length + 1);
-      // A cookie may only be scoped to the responding host or a parent domain of it.
-      const domainAttr = attr("domain")?.replace(/^\./, "").toLowerCase();
-      const hostOnly = !domainAttr || !domainMatch(url.hostname, domainAttr);
-      const domain = hostOnly ? url.hostname : domainAttr;
-      const expires = attr("expires");
-      const expired = Number(attr("max-age")) <= 0 || (expires !== undefined && Date.parse(expires) < Date.now());
-      this.cookies = this.cookies.filter((c) => !(c.name === name && c.domain === domain));
-      if (!expired) this.cookies.push({ name, value: pair.slice(eq + 1), domain, hostOnly });
-    }
-  }
-
-  header(url: URL): string {
-    return this.cookies
-      .filter((c) => (c.hostOnly ? c.domain === url.hostname : domainMatch(url.hostname, c.domain)))
-      .map((c) => `${c.name}=${c.value}`)
-      .join("; ");
-  }
-}
-
-class Browser {
-  private readonly jar = new CookieJar();
-
-  constructor(private readonly allowHttp: boolean) {}
-
-  /** Follows redirects by hand so each hop gets its own host's cookies. */
-  async open(
-    url: URL,
-    init: { method?: "GET" | "POST"; body?: URLSearchParams; accept?: string } = {},
-  ): Promise<{ url: URL; res: Response; text: string }> {
-    let method = init.method ?? "GET";
-    let body = init.body;
-    for (let hop = 0; hop <= MAX_REDIRECTS; hop++) {
-      if (url.protocol !== "https:" && !(this.allowHttp && url.protocol === "http:")) {
-        throw new CanvasError(`Refusing non-HTTPS request to ${url.origin}`);
-      }
-      const cookie = this.jar.header(url);
-      let res: Response;
-      try {
-        res = await fetch(url, {
-          method,
-          body,
-          redirect: "manual",
-          headers: { ...(cookie ? { cookie } : {}), ...(init.accept ? { accept: init.accept } : {}) },
-          signal: AbortSignal.timeout(REQUEST_TIMEOUT_MS),
-        });
-      } catch (err) {
-        throw new CanvasError(`Could not reach ${url.origin}: ${err instanceof Error ? err.message : String(err)}`);
-      }
-      this.jar.store(url, res);
-      const location = res.headers.get("location");
-      if (res.status >= 300 && res.status < 400 && location) {
-        await res.body?.cancel();
-        url = new URL(location, url);
-        // 307 and 308 repeat the request as it was; other redirects become a GET.
-        if (res.status !== 307 && res.status !== 308) {
-          method = "GET";
-          body = undefined;
-        }
-        continue;
-      }
-      return { url, res, text: await res.text() };
-    }
-    throw new CanvasError(`Too many redirects from ${url.origin}`);
-  }
-}
-
-function decodeEntities(s: string): string {
-  const named: Record<string, string> = { amp: "&", quot: '"', apos: "'", lt: "<", gt: ">" };
-  return s.replace(/&(#x[0-9a-f]+|#\d+|amp|quot|apos|lt|gt);/gi, (_, e: string) => {
-    const lower = e.toLowerCase();
-    if (lower.startsWith("#x")) return String.fromCodePoint(parseInt(lower.slice(2), 16));
-    if (lower.startsWith("#")) return String.fromCodePoint(Number(lower.slice(1)));
-    return named[lower];
-  });
-}
-
-/** The first form on a page, i.e. an LTI launch page's auto-submitting form. */
-function findForm(html: string, base: URL): { action: URL; method: "GET" | "POST"; fields: URLSearchParams } | undefined {
-  const form = html.match(/<form\b([^>]*)>([\s\S]*?)<\/form>/i);
-  if (!form) return undefined;
-  const attr = (tag: string, name: string) => {
-    const m = tag.match(new RegExp(`\\s${name}\\s*=\\s*(?:"([^"]*)"|'([^']*)')`, "i"));
-    return m ? decodeEntities(m[1] ?? m[2]) : undefined;
-  };
-  const fields = new URLSearchParams();
-  for (const [input] of form[2].matchAll(/<input\b[^>]*>/gi)) {
-    const name = attr(input, "name");
-    if (name) fields.append(name, attr(input, "value") ?? "");
-  }
-  const method = attr(form[1], "method")?.toUpperCase() === "GET" ? "GET" : "POST";
-  return { action: new URL(attr(form[1], "action") ?? "", base), method, fields };
-}
-
 /** Finds the course's Echo360 navigation tab and gets a one-time launch link for it. */
 async function findEchoTool(c: CanvasClient, courseId: string): Promise<{ name: string; url: string }> {
-  const tabs = await c.getAll<Obj>(`courses/${courseId}/tabs`);
-  const toolIds = tabs
-    .filter((t) => t.type === "external")
-    .sort((a, b) => Number(LIKELY_TAB.test(b.label ?? "")) - Number(LIKELY_TAB.test(a.label ?? "")))
-    .map((t) => String(t.id).match(/^context_external_tool_(\d+)$/)?.[1])
-    .filter((id): id is string => Boolean(id));
-  for (const id of toolIds) {
-    const launch = await c
-      .get<Obj>(`courses/${courseId}/external_tools/sessionless_launch`, { id, launch_type: "course_navigation" })
-      .catch(() => undefined);
-    if (/echo360/i.test(launch?.name ?? "") && launch?.url) return { name: launch.name, url: launch.url };
+  const tools = (await navigationTools(c, courseId)).sort(
+    (a, b) => Number(LIKELY_TAB.test(b.label)) - Number(LIKELY_TAB.test(a.label)),
+  );
+  for (const tool of tools) {
+    const launch = await sessionlessLaunch(c, courseId, tool.toolId);
+    if (launch && /echo360/i.test(launch.name)) return launch;
   }
   throw new CanvasError("This course has no Echo360 lecture recordings tool in its navigation menu.");
 }
 
 async function launch(c: CanvasClient, courseId: string): Promise<Echo360Session> {
   const tool = await findEchoTool(c, courseId);
-  const start = new URL(tool.url);
-  if (start.origin !== c.origin) throw new CanvasError(`Unexpected launch link host ${start.origin}`);
-
-  const browser = new Browser(c.origin.startsWith("http:"));
-  let page = await browser.open(start);
-  for (let i = 0; i < MAX_FORMS && !SECTION_PATH.test(page.url.pathname); i++) {
-    const form = findForm(page.text, page.url);
-    if (!form) break;
-    if (form.method === "GET") {
-      form.action.search = form.fields.toString();
-      page = await browser.open(form.action);
-    } else {
-      page = await browser.open(form.action, { method: "POST", body: form.fields });
-    }
-  }
+  const { browser, page } = await followLaunch(c, tool.url, (url) => SECTION_PATH.test(url.pathname));
   const sectionId = page.url.pathname.match(SECTION_PATH)?.[1];
   if (!sectionId) {
     throw new CanvasError(
