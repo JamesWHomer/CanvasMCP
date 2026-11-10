@@ -1,5 +1,5 @@
 // End-to-end check: runs the built server (stdio and HTTP) against a mock Canvas API, a mock file-storage host,
-// a mock Echo360 (lecture recordings), a mock Ed (discussion and lessons) and a mock GitHub (where reports go).
+// a mock Echo360 (lecture recordings) and a mock Ed (discussion and lessons).
 import assert from "node:assert/strict";
 import { mkdtemp, readFile, readdir, rm, writeFile } from "node:fs/promises";
 import { createServer } from "node:http";
@@ -652,70 +652,12 @@ function readBody(req) {
   });
 }
 
-// ---------- mock GitHub issues (where report_issue files reports) ----------
-
-const GITHUB_TOKEN = "gh-test-token";
-const githubIssue = (fields) => ({
-  number: githubIssues.length + 1,
-  state: "open",
-  state_reason: null,
-  comments: 0,
-  created_at: new Date().toISOString(),
-  ...fields,
-  html_url: `https://github.com/test/private/issues/${githubIssues.length + 1}`,
-});
-const githubIssues = [];
-githubIssues.push(
-  githubIssue({
-    title: "Add a tool to export the whole gradebook as CSV",
-    body: "Declined earlier.\n\n<!-- canvas-mcp-report kind=feature -->",
-    state: "closed",
-    state_reason: "not_planned",
-    created_at: "2026-10-01T00:00:00Z",
-  }),
-);
-githubIssues.push(
-  githubIssue({ title: "list_modules should show each item's completion requirement", body: "Opened by hand, not a report." }),
-);
-githubIssues.push(
-  githubIssue({ title: "A pull request", body: "<!-- canvas-mcp-report kind=bug tool=get_profile -->", pull_request: {} }),
-);
-const githubComments = [];
-
-const github = createServer(async (req, res) => {
-  const send = (status, body) => {
-    res.writeHead(status, { "content-type": "application/json" });
-    res.end(JSON.stringify(body));
-  };
-  if (req.headers.authorization !== `Bearer ${GITHUB_TOKEN}`) return send(401, { message: "Bad credentials" });
-  const url = new URL(req.url, "http://github.test");
-  const match = url.pathname.match(/^\/repos\/test\/(private|public)(\/.*)?$/);
-  if (!match) return send(404, { message: "Not Found" });
-  const [, repo, rest = ""] = match;
-  if (req.method === "GET" && rest === "") return send(200, { full_name: `test/${repo}`, private: repo === "private" });
-  if (req.method === "GET" && rest === "/issues") return send(200, [...githubIssues].reverse());
-  if (req.method === "POST" && rest === "/issues") {
-    const issue = githubIssue(JSON.parse(await readBody(req)));
-    githubIssues.push(issue);
-    return send(201, issue);
-  }
-  const comment = rest.match(/^\/issues\/(\d+)\/comments$/);
-  if (req.method === "POST" && comment) {
-    const issue = githubIssues.find((i) => i.number === Number(comment[1]));
-    issue.comments++;
-    githubComments.push({ issue: issue.number, ...JSON.parse(await readBody(req)) });
-    return send(201, { id: githubComments.length });
-  }
-  send(404, { message: "Not Found" });
-});
-
 const listen = (server) =>
   new Promise((resolve) => server.listen(0, "127.0.0.1", () => resolve(`http://127.0.0.1:${server.address().port}`)));
 const baseUrl = await listen(canvas);
 const storageOrigin = await listen(storage);
 const echoOrigin = await listen(echo);
 const edOrigin = await listen(edServer);
-const githubOrigin = await listen(github);
 
 // ---------- harness ----------
 
@@ -1597,144 +1539,6 @@ await check("markdownToEd: blocks and inline formatting become Ed XML", async ()
 
 await writer.close();
 
-// ---------- report_issue ----------
-
-const reportEnv = {
-  CANVAS_BASE_URL: baseUrl,
-  CANVAS_API_TOKEN: TOKEN,
-  CANVAS_ALLOW_WRITES: "",
-  REPORTS_GITHUB_REPO: "test/private",
-  REPORTS_GITHUB_TOKEN: GITHUB_TOKEN,
-  REPORTS_GITHUB_API_URL: githubOrigin,
-  REPORTS_DAILY_LIMIT: "4",
-};
-const reporter = await connect(reportEnv);
-const report = (args) =>
-  call(reporter, "report_issue", {
-    user_goal: "Show the user the brief for an assignment in course 101.",
-    details: "Called the tool with the IDs from list_assignments and it failed, though the item exists in Canvas.",
-    ruled_out: "Rechecked the IDs and retried twice; canvas_api_get on the same item fails the same way.",
-    ...args,
-  });
-const issuesNow = () => githubIssues.length;
-
-await check("report_issue: listed only when a tracker is configured, and mentioned in the instructions", async () => {
-  const { tools } = await reporter.listTools();
-  assert.equal(tools.length, READ_TOOLS + LOCAL_TOOLS + 1);
-  const tool = tools.find((t) => t.name === "report_issue");
-  assert.equal(tool.annotations.readOnlyHint, false);
-  assert.match(tool.description, /When in doubt, don't file/);
-  assert.deepEqual(tool.inputSchema.required.sort(), ["details", "kind", "ruled_out", "title", "user_goal"]);
-  assert.match(reporter.getInstructions(), /report_issue/);
-  assert.doesNotMatch(client.getInstructions(), /report_issue/);
-});
-
-await check("report_issue: a bug must name a real tool, and thin reports are refused", async () => {
-  const before = issuesNow();
-  const noTool = await report({ kind: "bug", title: "Something is broken somewhere" });
-  assert.equal(noTool.isError, true);
-  assert.match(noTool.data, /needs tool/);
-  const madeUp = await report({ kind: "bug", title: "make_coffee burns the coffee", tool: "make_coffee" });
-  assert.equal(madeUp.isError, true);
-  assert.match(madeUp.data, /no tool called "make_coffee"/);
-  const itself = await report({ kind: "bug", title: "report_issue is too strict", tool: "report_issue" });
-  assert.equal(itself.isError, true);
-  const thin = await report({ kind: "bug", title: "get_assignment broken", tool: "get_assignment", details: "It broke." });
-  assert.equal(thin.isError, true);
-  assert.equal(issuesNow(), before, "nothing was filed");
-});
-
-await check("report_issue: files a scrubbed bug with the server's own record of the failing call", async () => {
-  const failed = await call(reporter, "get_assignment", { course_id: "101", assignment_id: "999" });
-  assert.equal(failed.isError, true);
-  const { data } = await report({
-    kind: "bug",
-    title: "get_assignment errors for an assignment that exists",
-    tool: "mcp__canvas__get_assignment",
-    details: `get_assignment(course_id 101, assignment_id 999) returned a 404. Token ${TOKEN}, mail me at student@example.edu, cc @octocat.`,
-  });
-  assert.equal(data.status, "filed");
-  const issue = githubIssues.at(-1);
-  assert.equal(data.report, `#${issue.number}`);
-  assert.equal(issue.title, "get_assignment errors for an assignment that exists");
-  assert.deepEqual(issue.labels, ["agent-report", "bug"]);
-  assert.match(issue.body, /<!-- canvas-mcp-report kind=bug tool=get_assignment -->/);
-  assert.match(issue.body, /Unverified/);
-  assert.match(issue.body, /\| Server \| local \(stdio\)/);
-  assert.match(issue.body, /### Recent calls to `get_assignment` seen by the server/);
-  assert.match(issue.body, /error  \{"course_id":"101","assignment_id":"999"\}/);
-  assert.ok(!issue.body.includes(TOKEN), "the Canvas token is redacted");
-  assert.ok(!issue.body.includes("student@example.edu"), "email addresses are redacted");
-  assert.ok(issue.body.includes("@​octocat"), "@mentions are defused");
-});
-
-await check("report_issue: the same problem again is added to the open report", async () => {
-  const before = issuesNow();
-  const { data } = await report({
-    kind: "bug",
-    title: "get_assignment returns an error for an existing assignment",
-    tool: "get_assignment",
-  });
-  assert.equal(data.status, "already_reported");
-  assert.equal(data.report, `#${before}`);
-  assert.equal(issuesNow(), before);
-  const comment = githubComments.at(-1);
-  assert.equal(comment.issue, before);
-  assert.match(comment.body, /Reported again by an agent/);
-});
-
-await check("report_issue: something the developer declined isn't filed again", async () => {
-  const before = issuesNow();
-  const { data } = await report({ kind: "feature", title: "Add a tool that exports the gradebook as a CSV" });
-  assert.equal(data.status, "declined");
-  assert.equal(data.report, "#1");
-  assert.equal(issuesNow(), before);
-});
-
-await check("report_issue: features are filed, and issues opened by hand or PRs aren't treated as reports", async () => {
-  const { data } = await report({
-    kind: "feature",
-    title: "list_modules should show each item's completion requirement",
-    tool: "list_modules",
-  });
-  assert.equal(data.status, "filed");
-  const issue = githubIssues.at(-1);
-  assert.deepEqual(issue.labels, ["agent-report", "enhancement"]);
-  assert.match(issue.body, /### What's missing/);
-  assert.match(issue.body, /None in the last 2 hours/);
-});
-
-await check("report_issue: stops at the daily limit", async () => {
-  assert.equal((await report({ kind: "bug", title: "list_files misses files inside folders", tool: "list_files" })).data.status, "filed");
-  assert.equal((await report({ kind: "bug", title: "get_syllabus drops embedded tables", tool: "get_syllabus" })).data.status, "filed");
-  const before = issuesNow();
-  const over = await report({ kind: "bug", title: "get_quiz shows the wrong question count", tool: "get_quiz" });
-  assert.equal(over.isError, true);
-  assert.match(over.data, /last 24 hours/);
-  assert.equal(issuesNow(), before);
-});
-
-await reporter.close();
-
-await check("report_issue: refuses to file into a public repository", async () => {
-  const publicReporter = await connect({ ...reportEnv, REPORTS_GITHUB_REPO: "test/public" });
-  try {
-    const before = issuesNow();
-    const result = await call(publicReporter, "report_issue", {
-      kind: "feature",
-      title: "Add a tool for something new entirely",
-      user_goal: "Do something the tools can't do yet.",
-      details: "No tool here covers this, and the agent tried every plausible one first.",
-      ruled_out: "Tried canvas_api_get and the related list tools; none of them return this data.",
-    });
-    assert.equal(result.isError, true);
-    assert.match(result.data, /public/);
-    assert.equal(issuesNow(), before);
-  } finally {
-    await publicReporter.close();
-  }
-});
-
 // ---------- HTTP entry point, served the way Vercel would: a Web Request in, a Web Response out ----------
 
 const ACCESS_KEY = "test-access-key";
@@ -1796,25 +1600,6 @@ await check("HTTP: writes follow CANVAS_ALLOW_WRITES, but never read local files
   }
 });
 
-await check("HTTP: report_issue appears when a tracker is configured", async () => {
-  Object.assign(process.env, {
-    REPORTS_GITHUB_REPO: "test/private",
-    REPORTS_GITHUB_TOKEN: GITHUB_TOKEN,
-    REPORTS_GITHUB_API_URL: githubOrigin,
-  });
-  try {
-    const client = await httpClient(`${httpBase}/mcp/${ACCESS_KEY}`);
-    const { tools } = await client.listTools();
-    assert.equal(tools.length, READ_TOOLS + 1);
-    assert.ok(tools.some((t) => t.name === "report_issue"));
-    await client.close();
-  } finally {
-    delete process.env.REPORTS_GITHUB_REPO;
-    delete process.env.REPORTS_GITHUB_TOKEN;
-    delete process.env.REPORTS_GITHUB_API_URL;
-  }
-});
-
 await check("HTTP: wrong or missing key is rejected with 401", async () => {
   const body = JSON.stringify({ jsonrpc: "2.0", id: 1, method: "tools/list" });
   const headers = { "content-type": "application/json", accept: "application/json, text/event-stream" };
@@ -1839,7 +1624,6 @@ canvas.close();
 storage.close();
 echo.close();
 edServer.close();
-github.close();
 await rm(downloadDir, { recursive: true });
 console.log(failures ? `\n${failures} check(s) failed` : "\nAll checks passed");
 process.exit(failures ? 1 : 0);

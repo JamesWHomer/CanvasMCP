@@ -7,7 +7,6 @@ An [MCP](https://modelcontextprotocol.io) server for the Canvas LMS REST API. It
 - read, search and catch up on Ed Discussion (edstem.org) and read Ed Lessons
 - work out what you need to hit a target grade
 - optionally submit assignments, post replies (in Canvas or on Ed) and send messages, each after you approve a preview
-- optionally let agents file bug reports and feature requests about these tools to a private GitHub repo, for the developer to work through
 
 It signs in with a Canvas personal access token. Echo360 and Ed are reached through their tabs in Canvas, so they need no separate login.
 
@@ -76,7 +75,7 @@ To try it, ask "what's due this week on Canvas?". Or call `get_profile` to check
 
 ## Remote server (Vercel)
 
-The Vercel project `canvas-mcp` serves the same tools over Streamable HTTP from `api/mcp.ts`. It runs in Sydney (`syd1`). It holds these production environment variables:
+The Vercel project `canvas-mcp` serves the same tools over Streamable HTTP from `api/mcp.ts`. It runs in Sydney (`syd1`). It holds three production environment variables:
 
 | Variable | Purpose |
 | --- | --- |
@@ -84,7 +83,6 @@ The Vercel project `canvas-mcp` serves the same tools over Streamable HTTP from 
 | `CANVAS_API_TOKEN` | Canvas token (secret) |
 | `MCP_ACCESS_KEY` | Random key every request must present (secret; a copy is in the local `.env`) |
 | `CANVAS_ALLOW_WRITES` | `true` turns on the [write tools](#write-tools) |
-| `REPORTS_GITHUB_REPO`, `REPORTS_GITHUB_TOKEN` | Turn on [`report_issue`](#bug-reports-and-feature-requests-from-agents) (the token is secret) |
 
 Every request must carry the access key, otherwise it gets a `401`. If `MCP_ACCESS_KEY` isn't set, the server rejects every request. The key can go in the URL path or in a header:
 
@@ -177,23 +175,3 @@ These are off unless `CANVAS_ALLOW_WRITES=true`. They're on in the local `.env` 
 `submit_assignment`, `post_discussion_reply`, `send_message`, `ed_post_thread` and `ed_reply` are two-step. A call without `confirm: true` only returns a preview, which also flags late submissions, attempts left and disallowed file types. For a group assignment it also names your group and any teammate's submission it would replace. The action happens only on a second call with `confirm: true`, after you've approved the preview. Quizzes can't be taken through this server.
 
 **Large files.** The Vercel server accepts about 3 MB per request, so inline contents only suit small files. For anything bigger, give `submit_assignment` a public download link (`files: [{ url }]`). Canvas downloads the file itself, so it never passes through this server. Google Drive and Dropbox share links are converted to direct downloads automatically, as long as the file is shared with "Anyone with the link". The preview checks the link first and refuses one that opens a web page (such as a sign-in page) instead of the file. If Canvas is still downloading after about 2½ minutes, nothing is submitted and the result says how to finish. The local server can also upload files of any size from disk (`path`).
-
-### Bug reports and feature requests from agents
-
-`report_issue` lets an agent tell the developer when one of these tools is broken, or when the user needed something none of them can do. It's off unless both `REPORTS_GITHUB_REPO` and `REPORTS_GITHUB_TOKEN` are set. Each report becomes an issue in that GitHub repository, labelled `agent-report` plus `bug` or `enhancement`.
-
-The bar for filing is high, so the tracker doesn't fill up with noise:
-
-- **The tool's description sets the rules.** A bug has to happen with correct arguments, be checked against another source, and not be Canvas's doing (permissions, a hidden or locked item, a course setting, an expired token, a passing outage). A feature has to be something the user actually asked for that no tool here can do, `canvas_api_get` included. The agent has to say what the user wanted, what happened, and what it ruled out.
-- **The server checks the report.** A bug must name one of this server's tools. The server attaches its own record of the last few calls to that tool (arguments, and the error or result size), so you see what really happened as well as the agent's account of it.
-- **Duplicates are merged.** If an open report already describes the same problem, the new sighting goes on it as a comment. Close a report as **not planned** and agents won't file it again. If one closed as completed comes back, the new report links to it as a possible regression.
-- **There's a daily limit:** 10 new reports per 24 hours by default (`REPORTS_DAILY_LIMIT`).
-- **Private data stays out.** Agents are told to leave out grades, message and submission contents and other people's names. The server also strips tokens, access keys and email addresses, and defuses `@mentions`. It refuses to file into a public repository unless `REPORTS_ALLOW_PUBLIC=true`.
-
-To set it up:
-
-1. Create a **private** repository for the reports (for example `you/CanvasMCP-reports`). Keep it separate from this one if this one is public.
-2. Create a [fine-grained personal access token](https://github.com/settings/personal-access-tokens/new) that can reach only that repository, with **Issues: Read and write** permission.
-3. Set `REPORTS_GITHUB_REPO=you/CanvasMCP-reports` and `REPORTS_GITHUB_TOKEN=<token>` in `.env`, and on Vercel (`vercel env add REPORTS_GITHUB_TOKEN production --sensitive`). Then redeploy, and restart the local server.
-
-Read the reports with `gh issue list -R you/CanvasMCP-reports --label agent-report`. They're written by an agent, so reproduce each one before acting on it.
