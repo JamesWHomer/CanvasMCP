@@ -1,5 +1,6 @@
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { CanvasClient } from "./canvas.js";
+import { ReportStore, reportsFromEnv } from "./reports.js";
 import { registerTools } from "./tools/index.js";
 
 /** Builds a Canvas client from CANVAS_BASE_URL / CANVAS_API_TOKEN, or undefined if either is missing. */
@@ -20,6 +21,7 @@ export function createCanvasServer(
   { allowLocalFiles }: { allowLocalFiles: boolean },
 ): McpServer {
   const allowWrites = writesEnabled();
+  const reports = reportsFromEnv();
   const server = new McpServer(
     { name: "canvas", version: "1.1.0" },
     {
@@ -41,6 +43,10 @@ export function createCanvasServer(
             "and are visible to others: always call them first without confirm, show the user the preview, and only call " +
             "again with confirm: true after the user explicitly approves. To submit a large file, give submit_assignment a " +
             "public download link (files[].url) or a file_id rather than base64 contents."
+          : "") +
+        (reports
+          ? " If one of these tools is itself broken, or the user needs something none of them can do, you can tell the " +
+            "developer with report_issue; its description says what qualifies."
           : ""),
     },
   );
@@ -55,7 +61,7 @@ export function createCanvasServer(
       }
       return client;
     },
-    { allowWrites, allowLocalFiles },
+    { allowWrites, allowLocalFiles, reports: reports && new ReportStore(reports) },
   );
   return server;
 }
